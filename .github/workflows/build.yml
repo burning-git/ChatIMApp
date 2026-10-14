@@ -1,0 +1,57 @@
+name: Build macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS (Intel + Apple Silicon)
+    timeout-minutes: 60
+    runs-on: macos-14
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: universal-apple-darwin
+      - name: Install frontend and desktop build tools
+        run: npm ci --registry=https://registry.npmjs.org
+      - name: Test chat logic
+        run: npm test
+      - name: Check types and prepare frontend assets
+        run: npm run build
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Test native backend
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+      - name: Build native installers
+        run: npm run package:mac
+      - name: Upload installable apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: Echo-universal-apple-darwin
+          path: installers/universal-apple-darwin/
+          if-no-files-found: error
+          retention-days: 30
