@@ -572,21 +572,37 @@ fn update_session_inner(
 }
 
 #[tauri::command]
-fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
-    if state
-        .pending_sessions
-        .lock()
-        .map_err(|e| e.to_string())?
-        .contains(&session_id)
-    {
+async fn delete_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    delete_session_inner(&state, &session_id)?;
+    state.shares.write().await.retain(|_, id| id != &session_id);
+    Ok(())
+}
+
+fn delete_session_inner(state: &AppState, session_id: &str) -> Result<(), String> {
+    // Prevent a concurrent request from recreating this session during cleanup.
+    let sessions = state.pending_sessions.lock().map_err(|e| e.to_string())?;
+    if sessions.contains(session_id) {
         return Err("请等这个会话的回复完成后再删除".into());
     }
-    for path in db_files(&state)? {
+    for path in db_files(state)? {
         let conn = open_database(&path)?;
-        conn.execute("DELETE FROM messages WHERE session_id=?1", [&session_id])
+        // Base64 and URLs live in messages.images, with no separate image cache.
+        conn.execute_batch("PRAGMA secure_delete=ON;")
             .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM sessions WHERE id=?1", [&session_id])
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM messages WHERE session_id=?1", [session_id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM sessions WHERE id=?1", [session_id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        // Also compact on a repeated delete, if earlier cleanup was interrupted.
+        conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if busy != 0 {
+            return Err("会话记录已删除，但数据库正被占用，请稍后重试以完成图片空间清理".into());
+        }
     }
     Ok(())
 }
@@ -683,19 +699,7 @@ async fn send_message_with_progress(
     if retry_message_id.is_none() && content.trim().is_empty() && images.is_empty() {
         return Err("请先输入文字或添加图片".into());
     }
-    if images.len() > 4
-        || images.iter().any(|image| {
-            image.len() > 17 * 1024 * 1024
-                || !(image.starts_with("data:image/png;base64,")
-                    || image.starts_with("data:image/jpeg;base64,")
-                    || image.starts_with("data:image/webp;base64,")
-                    || image.starts_with("data:image/gif;base64,"))
-        })
-    {
-        return Err(
-            "每条消息最多 4 张图片，仅支持 PNG、JPEG、WebP 和 GIF，每张不超过 12 MB".into(),
-        );
-    }
+    image_attachment::validate(&images)?;
     let _permit = state
         .parallel_limit
         .clone()
@@ -933,7 +937,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            image_attachment::load_image_url,
             get_settings,
             set_settings,
             list_sessions,

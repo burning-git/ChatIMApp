@@ -1,6 +1,6 @@
 import type { ChatMessage, ChatSession, Settings } from "./types";
 import { readChatStream } from "./chat-stream";
-import { readImageUrl, validateImageUrl } from "./image-url";
+import { validateImages, validateImageUrl } from "./image-url";
 
 type RequestOptions = Pick<ChatSession, "stream" | "temperature">;
 
@@ -102,9 +102,7 @@ async function saveReply(session: ChatSession, userId: string, oldReply: ChatMes
 
 export const api = {
   async imageFromUrl(value: string): Promise<string> {
-    const url = validateImageUrl(value);
-    if (desktop) return invoke<string>("load_image_url", { url });
-    return readImageUrl(url);
+    return validateImageUrl(value);
   },
   async copyText(text: string): Promise<void> {
     if (desktop) return invoke<void>("plugin:clipboard-manager|write_text", { text });
@@ -149,8 +147,12 @@ export const api = {
       await invoke<void>("unshare_session", { sessionId });
       return invoke<void>("delete_session", { sessionId });
     }
+    if (pending.has(sessionId)) throw new Error("请等这个会话的回复完成后再删除");
     allDays().forEach(day => {
-      localStorage.setItem(day.key, JSON.stringify({ sessions: day.sessions.filter(item => item.id !== sessionId), messages: day.messages.filter(item => item.sessionId !== sessionId) }));
+      const sessions = day.sessions.filter(item => item.id !== sessionId);
+      const messages = day.messages.filter(item => item.sessionId !== sessionId);
+      if (sessions.length || messages.length) localStorage.setItem(day.key, JSON.stringify({ sessions, messages }));
+      else localStorage.removeItem(day.key);
     });
   },
   async messages(sessionId: string): Promise<ChatMessage[]> {
@@ -161,6 +163,7 @@ export const api = {
     return api.send(sessionId, "", [], messageId, onChunk);
   },
   async send(sessionId: string, content: string, images: string[], retryMessageId?: string, onChunk?: (delta: string) => void): Promise<ChatMessage> {
+    if (!retryMessageId) validateImages(images);
     if (desktop) return retryMessageId
       ? invokeMessage("retry_message", { sessionId, messageId: retryMessageId }, onChunk)
       : invokeMessage("send_message", { sessionId, content, images }, onChunk);

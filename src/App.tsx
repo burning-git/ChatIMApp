@@ -7,6 +7,7 @@ import {
   Sparkles, SquarePen, Trash2, X,
 } from "lucide-react";
 import { api, desktop } from "./api";
+import { MAX_IMAGES } from "./image-url";
 import { version as appVersion } from "../package.json";
 import type { ChatMessage, ChatSession, Draft, Settings } from "./types";
 
@@ -180,7 +181,7 @@ function App() {
 
   async function importImages(sessionId: string, count: number, loader: () => Promise<string[]>): Promise<boolean> {
     if (!sessionId || imageImportsRef.current.has(sessionId)) return false;
-    if ((drafts[sessionId]?.images.length || 0) + count > 4) { setToast("每条消息最多添加 4 张图片"); return false; }
+    if ((drafts[sessionId]?.images.length || 0) + count > MAX_IMAGES) { setToast(`每条消息最多添加 ${MAX_IMAGES} 张图片`); return false; }
     imageImportsRef.current.add(sessionId);
     setImageImports([...imageImportsRef.current]);
     try {
@@ -380,6 +381,9 @@ function App() {
       setMessages(items => { const copy = { ...items }; delete copy[id]; return copy; });
       setDrafts(items => { const copy = { ...items }; delete copy[id]; return copy; });
       setErrors(items => { const copy = { ...items }; delete copy[id]; return copy; });
+      setRetryTargets(items => { const copy = { ...items }; delete copy[id]; return copy; });
+      setStreamingText(items => { const copy = { ...items }; delete copy[id]; return copy; });
+      setCopiedMessageId("");
       setShareUrls(items => { const copy = { ...items }; delete copy[id]; return copy; });
       if (remaining.length) setActiveId(remaining[0].id);
       else {
@@ -387,7 +391,7 @@ function App() {
         setSessions([created]); setOpenIds([created.id]); setActiveId(created.id);
       }
       setModal(null);
-      setToast("会话已删除");
+      setToast("会话及图片记录已删除");
     } catch (error) { setToast(String(error)); }
   }
 
@@ -477,7 +481,7 @@ function App() {
             <div className={`message-avatar ${message.role}`}>{message.role === "assistant" ? <AudioLines size={15} /> : "E"}</div>
             <div className="message-body"><div className="message-byline"><strong>{message.role === "assistant" ? "Echo" : "你"}</strong><span>{timeLabel(message.createdAt)}</span>{message.role === "assistant" && <span className="model-tag">{settings.model}</span>}</div>
               {message.content && <div className="message-content">{message.content}</div>}
-              {!!message.images.length && <div className="message-images">{message.images.map((image, imageIndex) => <img key={imageIndex} src={image} alt="消息附件" />)}</div>}
+              {!!message.images.length && <div className="message-images">{message.images.map((image, imageIndex) => <img key={imageIndex} src={image} referrerPolicy="no-referrer" alt="消息附件" />)}</div>}
               <div className="message-tools message-actions"><button onClick={() => copyMessage(message)} title={message.content ? "复制这条消息的文字" : "这条消息只有图片，没有可复制的文字"} disabled={!message.content}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}{copiedMessageId === message.id ? "已复制" : "复制"}</button><button onClick={() => retry(message.id)} disabled={!canRetry} title="使用原问题和图片重新生成回复；成功后替换该轮回复，保留后续消息"><RotateCw size={13} />{busy.includes(activeId) && retryTargets[activeId] === message.id ? "重试中…" : "重试"}</button></div>
             </div>
           </article>)}
@@ -488,7 +492,7 @@ function App() {
       </section>
 
       <div className="composer-area" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); if (event.dataTransfer.files.length) addFiles(event.dataTransfer.files); }}>
-        {!!draft.images.length && <div className="attachment-strip">{draft.images.map((src, index) => <div className="attachment-preview" key={`${index}-${src.slice(-14)}`}><img src={src} alt={`待发送图片 ${index + 1}`} /><button title="移除图片" onClick={() => patchDraft({ images: draft.images.filter((_, i) => i !== index) })}><X size={13} /></button></div>)}<span className="attachment-hint">图片会以 Base64 编码发送</span></div>}
+        {!!draft.images.length && <div className="attachment-strip">{draft.images.map((src, index) => <div className="attachment-preview" key={`${index}-${src.slice(-14)}`}><img src={src} referrerPolicy="no-referrer" alt={`待发送图片 ${index + 1}`} title={src.startsWith("data:") ? "本地图片" : "链接图片"} /><button title="移除图片" onClick={() => patchDraft({ images: draft.images.filter((_, i) => i !== index) })}><X size={13} /></button></div>)}<span className="attachment-hint">{draft.images.length} / {MAX_IMAGES} 张 · 本地图片与链接可混用</span></div>}
         <div className="composer-card">
           <textarea ref={composer} value={draft.text} onChange={event => patchDraft({ text: event.target.value })} onKeyDown={onComposerKey} placeholder="向 Echo 提问，或拖入一张图片…" rows={2} />
           <div className="composer-footer">
@@ -496,7 +500,7 @@ function App() {
             <div className="composer-right"><span className="send-hint">↵ 发送 · ⇧↵ 换行</span><button className="send-button" disabled={!draft.text.trim() && !draft.images.length || busy.includes(activeId) || imageImports.includes(activeId)} title="发送消息" onClick={send}>{busy.includes(activeId) ? <span className="send-spinner" /> : <ArrowUp size={17} />}</button></div>
           </div>
         </div>
-        <div className="composer-meta"><span><LockKeyhole size={12} /> 仅你与模型可见</span><span>{imageImports.includes(activeId) ? "正在添加图片…" : "图片最大 12 MB · 每条最多 4 张"}</span></div>
+        <div className="composer-meta"><span><LockKeyhole size={12} /> 仅你与模型可见</span><span>{imageImports.includes(activeId) ? "正在添加图片…" : "本地图片最大 12 MB · 每条最多 9 张"}</span></div>
       </div>
       <footer className="statusbar"><span className="status-ready"><i /> 本机私有</span><span>{settings.baseUrl ? `已连接 · ${settings.model}` : "设置 API 地址以开始对话"}</span><button onClick={() => { setSettingsDraft(settings); setSettingsError(""); setModal("settings"); }}>{settings.baseUrl ? "更改连接" : "配置连接"}<ChevronDown size={12} /></button></footer>
     </main>
@@ -541,13 +545,13 @@ function App() {
 
       {modal === "image-url" && <section className="dialog image-url-dialog" role="dialog" aria-modal="true" aria-labelledby="image-url-title">
         <div className="dialog-top"><span className="dialog-icon violet"><Link2 size={17} /></span><button className="icon-button" title="关闭图片链接" onClick={() => setModal(null)}><X size={18} /></button></div>
-        <div className="dialog-heading"><h2 id="image-url-title">添加图片链接</h2><p>粘贴图片的直接链接，添加后可在输入框上方预览。</p></div>
-        <label className="field-label">图片链接<input autoFocus type="url" value={imageUrlDraft} disabled={imageImports.includes(activeId)} onChange={event => setImageUrlDraft(event.target.value)} placeholder="https://example.com/image.png" onKeyDown={event => { if (event.key === "Enter" && !event.nativeEvent.isComposing) addImageUrl(); }} /><small className="field-help">支持 PNG、JPEG、WebP、GIF，每张不超过 12 MB。</small></label>
+        <div className="dialog-heading"><h2 id="image-url-title">添加图片链接</h2><p>粘贴图片直链，添加后可预览，发送时保留原链接。</p></div>
+        <label className="field-label">图片链接<input autoFocus type="url" value={imageUrlDraft} disabled={imageImports.includes(activeId)} onChange={event => setImageUrlDraft(event.target.value)} placeholder="https://example.com/image.png" onKeyDown={event => { if (event.key === "Enter" && !event.nativeEvent.isComposing) addImageUrl(); }} /><small className="field-help">请使用模型服务可访问的图片直链，避免使用需要登录的链接。</small></label>
         {imageUrlError && <div className="field-error" role="alert">{imageUrlError}</div>}
         <div className="dialog-actions"><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-primary" disabled={!imageUrlDraft.trim() || imageImports.includes(activeId)} onClick={addImageUrl}>{imageImports.includes(activeId) ? "正在添加…" : "添加图片"}</button></div>
       </section>}
       {modal === "share" && <section className="dialog share-dialog" role="dialog" aria-modal="true" aria-labelledby="share-title"><div className="dialog-top"><span className="dialog-icon mint"><ShieldCheck size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="share-title">只读链接已创建</h2><p>同一 Wi-Fi 下的设备可以通过此链接查看会话记录。</p></div><div className="share-url-box"><Link2 size={15} /><span>{shareUrl}</span><button title="复制链接" onClick={copyShareLink}>{shareCopied ? <Check size={15} /> : <Copy size={15} />}</button></div><div className="share-warning"><LockKeyhole size={14} /><span>链接包含访问凭证。仅分享给你信任的人，关闭后该链接立即失效。</span></div><div className="dialog-actions split-actions"><button className="button-danger-quiet" onClick={stopShare}>关闭访问</button><button className="button-primary" onClick={() => setModal(null)}>{shareCopied ? "已复制" : "完成"}</button></div></section>}
-      {modal === "delete" && <section className="dialog delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><div className="dialog-top"><span className="dialog-icon rose"><Trash2 size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="delete-title">删除这个会话？</h2><p>“{current?.title}”及其所有消息会从本机移除。此操作无法撤销。</p></div><div className="delete-summary"><MessageSquarePlus size={16} /><span>{currentMessages.length} 条消息</span><span className="summary-divider" /><span>本地记录</span></div><div className="dialog-actions"><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-danger" onClick={deleteCurrent}>删除会话</button></div></section>}
+      {modal === "delete" && <section className="dialog delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><div className="dialog-top"><span className="dialog-icon rose"><Trash2 size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="delete-title">删除这个会话？</h2><p>“{current?.title}”及其消息、图片数据和草稿会从本机移除。此操作无法撤销。</p></div><div className="delete-summary"><MessageSquarePlus size={16} /><span>{currentMessages.length} 条消息</span><span className="summary-divider" /><span>本地记录</span></div><div className="dialog-actions"><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-danger" onClick={deleteCurrent}>删除会话</button></div></section>}
     </div>}
     {toast && <div className="toast"><span className="toast-mark"><Check size={13} /></span>{toast}</div>}
     {!desktop && <div className="preview-ribbon"><span className="preview-dot" />浏览器预览 · 数据保存在此浏览器</div>}

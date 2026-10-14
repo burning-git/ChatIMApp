@@ -164,8 +164,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px
 .inline-error .retry-button { display: inline-flex; width: auto; gap: 5px; padding: 3px 9px; height: auto; min-height: 24px; border: 1px solid #e7d5be; background: #fff; color: #8d6840; white-space: nowrap; font-size: 11px; }
 .retry-tools { opacity: 1; }
 .composer-area { flex: none; padding: 0 34px 8px; background: linear-gradient(0deg, #fff 88%, #ffffffea); }
-.attachment-strip { display: flex; align-items: center; gap: 8px; max-width: 720px; margin: 0 auto 8px; }
-.attachment-preview { position: relative; width: 52px; height: 52px; border: 1px solid #e5e7ef; border-radius: 8px; background: #fafaff; }
+.attachment-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 720px; margin: 0 auto 8px; }
+.attachment-preview { position: relative; flex: 0 0 52px; width: 52px; height: 52px; border: 1px solid #e5e7ef; border-radius: 8px; background: #fafaff; }
 .attachment-preview img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
 .attachment-preview > button { position: absolute; top: -6px; right: -6px; width: 19px; height: 19px; display: grid; place-items: center; border: 1px solid #fff; border-radius: 50%; color: #fff; background: #5b6172; cursor: pointer; }
 .attachment-hint { margin-left: 2px; color: #a0a4b0; font-size: 9px; }

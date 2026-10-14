@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { build } from "esbuild";
 import { webcrypto } from "node:crypto";
+import { fileURLToPath } from 'node:url';
 
-const compiled = await build({ entryPoints: [new URL("../src/api.ts", import.meta.url).pathname], bundle: true, write: false, format: "esm" });
+const compiled = await build({ entryPoints: [
+  fileURLToPath(new URL('../src/api.ts', import.meta.url))
+], bundle: true, write: false, format: "esm" });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString("base64")}`;
 globalThis.window = {};
 if (!globalThis.crypto) globalThis.crypto = webcrypto;
@@ -342,7 +345,7 @@ test("桌面发送与重试使用独立 IPC 通道转发流式片段", async () 
   } finally { globalThis.window = browserWindow; }
 });
 
-test("图片链接下载为 Base64 附件，拒绝无效链接、非图片和超大图片", async () => {
+test("图片链接保留原 URL，无下载或 Base64 转换，拒绝无效链接", async () => {
   const previousReader = globalThis.FileReader;
   const previousFetch = globalThis.fetch;
   class Reader {
@@ -359,20 +362,58 @@ test("图片链接下载为 Base64 附件，拒绝无效链接、非图片和超
     let requested;
     globalThis.fetch = async (url, options) => { requested = { url, options }; return new Response(png); };
     const image = await api.imageFromUrl(" https://example.test/image?version=1 " );
-    assert.equal(image, `data:image/png;base64,${png.toString("base64")}`);
-    assert.equal(requested.options.credentials, "omit");
-    assert.equal(requested.url, "https://example.test/image?version=1");
-    assert.equal(requested.options.headers, undefined);
+    assert.equal(image, "https://example.test/image?version=1");
+    assert.equal(requested, undefined);
     for (const url of ["file:///tmp/image.png", "javascript:alert(1)", "https://user:secret@example.test/a.png", "bad url"]) {
       await assert.rejects(api.imageFromUrl(url), /图片链接/);
     }
-    globalThis.fetch = async () => new Response("<html>not an image</html>", { headers: { "content-type": "image/png" } });
-    await assert.rejects(api.imageFromUrl("https://example.test/a.png"), /未返回支持的图片/);
-    globalThis.fetch = async () => new Response("", { headers: { "content-length": String(12 * 1024 * 1024 + 1) } });
-    await assert.rejects(api.imageFromUrl("https://example.test/a.png"), /12 MB/);
-    globalThis.fetch = async () => new Response(new Uint8Array(12 * 1024 * 1024 + 1));
-    await assert.rejects(api.imageFromUrl("https://example.test/a.png"), /12 MB/);
-    globalThis.fetch = async () => new Response("not found", { status: 404 });
-    await assert.rejects(api.imageFromUrl("https://example.test/a.png"), /404/);
+    const signed = "https://example.test/a.png?signature=a%2Fb&expires=123";
+    assert.equal(await api.imageFromUrl(signed), signed);
   } finally { globalThis.FileReader = previousReader; globalThis.fetch = previousFetch; }
+});
+
+test("九张混合图片发送与重试保留原来源，拒绝第十张及无效图片", async () => {
+  reset();
+  await api.saveSettings({ baseUrl: "https://example.test/v1", apiKey: "test-key", model: "test" });
+  const session = await api.create("混合图片");
+  const images = ["data:image/png;base64,aGVsbG8=", ...Array.from({ length: 8 }, (_, index) => `https://example.test/${index}.jpg?signature=a%2Fb`)];
+  const requests = [];
+  globalThis.fetch = async (_, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({ choices: [{ message: { content: "完成" } }] }), { headers: { "content-type": "application/json" } });
+  };
+  await api.send(session.id, "查看九张图", images);
+  const user = (await api.messages(session.id))[0];
+  assert.deepEqual(user.images, images);
+  await api.retry(session.id, user.id);
+  for (const request of requests) assert.deepEqual(request.messages[0].content.slice(1).map(part => part.image_url.url), images);
+  await assert.rejects(api.send(session.id, "第十张", [...images, images[1]]), /9/);
+  await assert.rejects(api.send(session.id, "无效链接", ["file:///tmp/a.png"]), /图片链接/);
+  await assert.rejects(api.send(session.id, "无效数据", ["data:image/png;base64,broken!"]), /数据无效/);
+  assert.equal(requests.length, 2);
+  assert.equal((await api.messages(session.id)).length, 2);
+});
+
+test("删除会话清理跨日图片及链接记录，保留其他会话与设置", async () => {
+  reset();
+  const gone = await api.create("删除图片");
+  const kept = await api.create("保留会话");
+  const settings = { baseUrl: "https://example.test/v1", apiKey: "test-key", model: "test" };
+  await api.saveSettings(settings);
+  const local = "data:image/png;base64,ZGVsZXRlLWltYWdl";
+  const link = "https://example.test/delete-this.png";
+  const currentKey = Object.keys(localStorage).find(key => key.startsWith("echo-day-"));
+  const current = JSON.parse(localStorage.getItem(currentKey));
+  current.messages = [{ id: "today", sessionId: gone.id, role: "user", content: "删除", images: [local, link], createdAt: gone.createdAt }];
+  localStorage.setItem(currentKey, JSON.stringify(current));
+  localStorage.setItem("echo-day-2000-01-01", JSON.stringify({ sessions: [gone], messages: [{ ...current.messages[0], id: "old" }] }));
+  await api.remove(gone.id);
+  assert.equal(localStorage.getItem("echo-day-2000-01-01"), null);
+  assert.deepEqual((await api.sessions()).map(session => session.id), [kept.id]);
+  assert.deepEqual(await api.messages(gone.id), []);
+  assert.deepEqual(await api.settings(), settings);
+  for (const key of Object.keys(localStorage)) {
+    assert.ok(!localStorage[key].includes(local));
+    assert.ok(!localStorage[key].includes(link));
+  }
 });
