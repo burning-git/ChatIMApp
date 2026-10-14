@@ -67,7 +67,7 @@ for (const format of platform.installers) {
 await writeFile(join(outputDir, "SHA256SUMS.txt"), files.map(file => `${file.sha256}  ${file.name}`).join("\n") + "\n");
 await writeFile(join(outputDir, "manifest.json"), JSON.stringify({ version, target, commit: process.env.GITHUB_SHA || null, files }, null, 2) + "\n");
 const location = process.env.GITHUB_ACTIONS
-  ? `从本次运行的 **Artifacts** 下载 \`Echo-${target}\`，解压后即可取得安装包。`
+  ? `最新版下载：[GitHub Releases](https://github.com/${process.env.GITHUB_REPOSITORY}/releases/latest)（同次提交的 Windows 和 macOS 打包均成功后自动更新）。\n\n本次构建的 ZIP 备份：从 **Artifacts** 下载 \`Echo-${target}\`。`
   : `安装包已保存到 ${outputDir}`;
 const summary = `### ${platform.label}\n\n` + files.map(file => `- ${file.name} (${(file.bytes / 1024 / 1024).toFixed(1)} MB)`).join("\n") + `\n\n${location}\n\n`;
 if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, summary);

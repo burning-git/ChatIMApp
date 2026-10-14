@@ -2,9 +2,16 @@
 
 一个面向 Windows 与 macOS 的本地优先 AI 桌面工作台。前端使用 React + Vite，桌面层使用 Tauri 2，数据按天写入 SQLite。
 
-项目的六项主要功能已有实现。前端类型检查、生产构建、18 项前端测试和 17 项 Rust 原生测试已通过。macOS 通用应用与 DMG 支持 Intel 和 Apple Silicon。真实模型调用需要在设置中填写自己的 API 地址、Key 和模型。
+项目的六项主要功能已有实现。前端类型检查、生产构建、26 项聊天与发布测试和 17 项 Rust 原生测试已通过。macOS 通用应用与 DMG 支持 Intel 和 Apple Silicon。真实模型调用需要在设置中填写自己的 API 地址、Key 和模型。
 
 当前测试包：`installers/universal-apple-darwin/Echo-0.1.6-macos-universal.dmg`。先退出正在运行的旧版本，打开 DMG，将「回声 Echo.app」拖入 Applications 并替换旧版本；原有设置和会话会保留。设置页底部可确认版本。安装镜像、应用签名和 Intel / Apple Silicon 双架构已通过校验。此版本使用本地临时签名，尚未配置 Apple Developer ID 与公证。
+
+**下载安装包：[GitHub Releases 最新版](https://github.com/burning-git/ChatIMApp/releases/latest)**。默认分支每次提交的 Windows 和 macOS 打包均成功后，会自动更新这个固定页面。
+
+| 平台 | 直接下载最新版 |
+| --- | --- |
+| Windows x64 | [EXE 安装程序](https://github.com/burning-git/ChatIMApp/releases/latest/download/Echo-windows-x64-setup.exe) · [MSI 安装程序](https://github.com/burning-git/ChatIMApp/releases/latest/download/Echo-windows-x64.msi) |
+| macOS（Intel + Apple Silicon） | [DMG 安装镜像](https://github.com/burning-git/ChatIMApp/releases/latest/download/Echo-macos-universal.dmg) |
 
 ## 已实现
 
@@ -58,7 +65,9 @@ GitHub Actions 在推送到 `main` / `master`、推送 `v*` 标签或创建 Pull
 | Windows x64 | [Build Windows installers](https://github.com/burning-git/ChatIMApp/actions/workflows/build-windows.yml) | `Echo-x86_64-pc-windows-msvc` |
 | macOS（Intel + Apple Silicon） | [Build macOS installer](https://github.com/burning-git/ChatIMApp/actions/workflows/build.yml) | `Echo-universal-apple-darwin` |
 
-手动打包时打开对应工作流，点击 **Run workflow** 并选择分支。完成后打开成功的运行记录，从 **Artifacts** 下载并解压即可取得安装包及校验清单；构建产物保留 30 天。Windows 构建使用 GitHub 提供的 Windows 环境及 C++ 工具，不需要配置额外 Secrets。
+默认分支同一次提交的两个平台打包都成功后，`Publish latest installers` 工作流会校验版本、提交与 SHA-256，并将安装包上传到固定的 `latest` Release，标记为 GitHub 最新版。Releases 文件名保持固定，上面的直接下载链接在更新后继续有效；校验清单与版本信息也会同步更新。旧提交的重跑、其他分支和 Pull Request 不会覆盖最新版，打包失败时保留上一次发布。
+
+手动打包时打开对应工作流，点击 **Run workflow** 并选择默认分支；两个平台需针对同一次提交都完成构建。日常下载从 **Releases → 最新版 → Assets** 取得 EXE、MSI 或 DMG。每次运行也保留 **Artifacts** ZIP 备份 30 天，Release 安装包不受这个 30 天期限影响。构建与发布使用 GitHub 自带的工具及 `GITHUB_TOKEN`，不需要配置额外 Secrets。
 
 macOS 通用构建需要安装 `aarch64-apple-darwin`、`x86_64-apple-darwin` 两个 Rust target。当前工程已在 `.build-tools` 内安装独立 Rust，`package:mac` 会自动使用它；其他机器可使用自己的最新 stable Rust。构建结束后自动收集 DMG 到 `installers/universal-apple-darwin/` 并生成 SHA-256 校验清单。正式对外分发需要配置 Apple Developer ID 签名与 macOS 公证。
 

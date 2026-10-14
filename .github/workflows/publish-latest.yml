@@ -1,0 +1,61 @@
+name: Publish latest installers
+
+on:
+  workflow_run:
+    workflows: [Build Windows installers, Build macOS installer]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-latest-installers
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Update latest release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Find successful builds of the same commit
+        id: builds
+        run: node scripts/publish-latest.mjs select
+      - name: Download Windows installers
+        if: steps.builds.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: Echo-x86_64-pc-windows-msvc
+          path: release-input/windows
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.builds.outputs.windows_run_id }}
+      - name: Download macOS installer
+        if: steps.builds.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: Echo-universal-apple-darwin
+          path: release-input/macos
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.builds.outputs.macos_run_id }}
+      - name: Publish installers to the latest release
+        if: steps.builds.outputs.ready == 'true'
+        env:
+          RELEASE_COMMIT: ${{ steps.builds.outputs.commit }}
+          WINDOWS_RUN_ID: ${{ steps.builds.outputs.windows_run_id }}
+          MACOS_RUN_ID: ${{ steps.builds.outputs.macos_run_id }}
+        run: node scripts/publish-latest.mjs publish
