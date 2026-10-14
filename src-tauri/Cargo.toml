@@ -1,6 +1,6 @@
 [package]
 name = "echo-desktop"
-version = "0.1.5"
+version = "0.1.6"
 description = "Cross-platform local AI chat desktop app"
 authors = ["you"]
 edition = "2021"

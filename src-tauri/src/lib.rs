@@ -590,18 +590,24 @@ fn delete_session_inner(state: &AppState, session_id: &str) -> Result<(), String
         conn.execute_batch("PRAGMA secure_delete=ON;")
             .map_err(|e| e.to_string())?;
         let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM messages WHERE session_id=?1", [session_id])
+        let removed_messages = tx
+            .execute("DELETE FROM messages WHERE session_id=?1", [session_id])
             .map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM sessions WHERE id=?1", [session_id])
+        let removed_sessions = tx
+            .execute("DELETE FROM sessions WHERE id=?1", [session_id])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
-        // Also compact on a repeated delete, if earlier cleanup was interrupted.
-        conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
-        let busy: i64 = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
-            .map_err(|e| e.to_string())?;
-        if busy != 0 {
-            return Err("会话记录已删除，但数据库正被占用，请稍后重试以完成图片空间清理".into());
+        if removed_messages + removed_sessions > 0 {
+            // Reclaim image payload pages and remove deleted content from the WAL.
+            conn.execute_batch("VACUUM;").map_err(|e| e.to_string())?;
+            let busy: i64 = conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .map_err(|e| e.to_string())?;
+            if busy != 0 {
+                return Err(
+                    "会话记录已删除，但数据库正被占用，请稍后重试以完成图片空间清理".into(),
+                );
+            }
         }
     }
     Ok(())
@@ -1270,6 +1276,71 @@ mod tests {
     }
 
     #[test]
+    fn deleting_session_cleans_images_across_days_and_preserves_other_sessions() {
+        let state = test_state();
+        let marker = "DELETE_IMAGE_PAYLOAD_7d55".repeat(50_000);
+        let deleted_image = format!("data:image/png;base64,{marker}");
+        let deleted_link = "https://example.test/deleted-image.png";
+        let kept_image = "data:image/png;base64,aGVsbG8=";
+        let mut paths = Vec::new();
+        let mut previous_sizes = Vec::new();
+        for date in ["2000-01-01", "2000-01-02"] {
+            let path = database_path(&state, date);
+            let conn = open_database(&path).unwrap();
+            for id in ["gone", "kept"] {
+                conn.execute(
+                    "INSERT INTO sessions(id,title,created_at,updated_at) VALUES(?1,?1,'2000-01-01','2000-01-01')",
+                    [id],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO messages(id,session_id,role,content,images,created_at) VALUES(?1,'gone','user','删除',?2,'2000-01-01')",
+                params![format!("gone-{date}"), serde_json::to_string(&vec![deleted_image.as_str(), deleted_link]).unwrap()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages(id,session_id,role,content,images,created_at) VALUES(?1,'kept','user','保留',?2,'2000-01-01')",
+                params![format!("kept-{date}"), serde_json::to_string(&vec![kept_image]).unwrap()],
+            )
+            .unwrap();
+            drop(conn);
+            previous_sizes.push(fs::metadata(&path).unwrap().len());
+            paths.push(path);
+        }
+
+        state.pending_sessions.lock().unwrap().insert("gone".into());
+        assert!(delete_session_inner(&state, "gone")
+            .unwrap_err()
+            .contains("回复完成"));
+        assert_eq!(load_messages(&state, "gone").unwrap().len(), 2);
+        state.pending_sessions.lock().unwrap().clear();
+        delete_session_inner(&state, "gone").unwrap();
+
+        assert!(find_session(&state, "gone").unwrap().is_none());
+        assert!(load_messages(&state, "gone").unwrap().is_empty());
+        assert_eq!(load_messages(&state, "kept").unwrap().len(), 2);
+        for (path, previous_size) in paths.iter().zip(previous_sizes) {
+            let bytes = fs::read(path).unwrap();
+            assert!((bytes.len() as u64) < previous_size / 2);
+            assert!(!bytes
+                .windows(marker.len())
+                .any(|part| part == marker.as_bytes()));
+            assert!(!bytes
+                .windows(deleted_link.len())
+                .any(|part| part == deleted_link.as_bytes()));
+            assert_eq!(
+                open_database(path)
+                    .unwrap()
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn escapes_shared_html_and_accepts_valid_endpoint_variants() {
         assert_eq!(
             html_escape("<script>\"&'</script>"),
@@ -1345,11 +1416,15 @@ mod tests {
         .unwrap();
         drop(conn);
         let image = "data:image/png;base64,aGVsbG8=".to_string();
+        let mut images = vec![image.clone()];
+        images.extend(
+            (0..8).map(|index| format!("https://example.test/photo?index={index}&signature=a%2Fb")),
+        );
         let failure = send_message_inner(
             &state,
             "s".into(),
             "保留这个问题".into(),
-            vec![image.clone()],
+            images.clone(),
             None,
         )
         .await;
@@ -1370,10 +1445,18 @@ mod tests {
         let history = load_messages(&state, "s").unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].id, original.id);
-        assert_eq!(history[0].images, vec![image]);
+        assert_eq!(history[0].images, images);
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
+        let sent_images = requests[0]["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|part| part["image_url"]["url"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(sent_images, images);
         drop(requests);
         assert!(send_message_inner(
             &state,

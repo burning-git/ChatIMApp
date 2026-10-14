@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "回声 Echo",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "identifier": "com.echo.chatdesktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -35,6 +35,11 @@
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-"
+    },
+    "windows": {
+      "wix": {
+        "language": "zh-CN"
+      }
     },
     "shortDescription": "A local-first AI chat workspace"
   }

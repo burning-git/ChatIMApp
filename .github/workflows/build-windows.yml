@@ -47,7 +47,19 @@ jobs:
       - name: Test native backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
       - name: Build Windows installers
-        run: npm run package:win
+        run: |
+          npm run package:win 2>&1 | Tee-Object -FilePath windows-package.log
+          exit $LASTEXITCODE
+      - name: Upload Windows packaging diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Echo-windows-packaging-diagnostics
+          path: |
+            windows-package.log
+            src-tauri/target/x86_64-pc-windows-msvc/release/wix/
+          if-no-files-found: ignore
+          retention-days: 30
       - name: Upload installable apps
         uses: actions/upload-artifact@v4
         with:
