@@ -29,10 +29,23 @@ use uuid::Uuid;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ModelProfile {
+    id: String,
+    name: String,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct Settings {
     base_url: String,
     api_key: String,
     model: String,
+    #[serde(default)]
+    models: Vec<ModelProfile>,
+    default_model_id: String,
 }
 
 impl Default for Settings {
@@ -41,7 +54,57 @@ impl Default for Settings {
             base_url: String::new(),
             api_key: String::new(),
             model: "gpt-4o-mini".into(),
+            models: vec![ModelProfile {
+                id: "legacy-default".into(),
+                name: "默认模型".into(),
+                base_url: String::new(),
+                api_key: String::new(),
+                model: "gpt-4o-mini".into(),
+            }],
+            default_model_id: "legacy-default".into(),
         }
+    }
+}
+
+impl Settings {
+    fn normalize(mut self) -> Self {
+        if self.models.is_empty() {
+            self.models.push(ModelProfile {
+                id: "legacy-default".into(),
+                name: "默认模型".into(),
+                base_url: self.base_url.clone(),
+                api_key: self.api_key.clone(),
+                model: self.model.clone(),
+            });
+            self.default_model_id = "legacy-default".into();
+        }
+        if !self
+            .models
+            .iter()
+            .any(|model| model.id == self.default_model_id)
+        {
+            self.default_model_id = self.models[0].id.clone();
+        }
+        if let Some(default) = self
+            .models
+            .iter()
+            .find(|model| model.id == self.default_model_id)
+        {
+            self.base_url = default.base_url.clone();
+            self.api_key = default.api_key.clone();
+            self.model = default.model.clone();
+        }
+        self
+    }
+
+    fn profile(&self, id: &str) -> Result<ModelProfile, String> {
+        let profile = self
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .cloned()
+            .ok_or_else(|| "这个会话使用的模型已不存在，请在会话设置中重新选择".to_string())?;
+        Ok(profile)
     }
 }
 
@@ -78,6 +141,8 @@ struct ChatSession {
     stream: bool,
     #[serde(default = "default_temperature")]
     temperature: Option<f64>,
+    #[serde(default = "default_model_id")]
+    model_id: String,
     created_at: String,
     updated_at: String,
     last_message: String,
@@ -89,12 +154,16 @@ fn default_stream() -> bool {
 fn default_temperature() -> Option<f64> {
     Some(0.0)
 }
+fn default_model_id() -> String {
+    "legacy-default".into()
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestOptions {
     stream: bool,
     temperature: Option<f64>,
+    model_id: String,
 }
 
 fn validate_temperature(temperature: Option<f64>) -> Result<(), String> {
@@ -115,6 +184,8 @@ struct ChatMessage {
     created_at: String,
     #[serde(default)]
     reply_to_id: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn now() -> String {
@@ -150,7 +221,8 @@ fn open_database(path: &PathBuf) -> Result<Connection, String> {
            role TEXT NOT NULL,
            content TEXT NOT NULL,
            images TEXT NOT NULL DEFAULT '[]',
-           created_at TEXT NOT NULL
+           created_at TEXT NOT NULL,
+           model TEXT
          );
          CREATE INDEX IF NOT EXISTS messages_session_time ON messages(session_id, created_at);",
     )
@@ -159,6 +231,12 @@ fn open_database(path: &PathBuf) -> Result<Connection, String> {
         ("messages", "reply_to_id", "TEXT"),
         ("sessions", "stream", "INTEGER NOT NULL DEFAULT 1"),
         ("sessions", "temperature", "REAL DEFAULT 0"),
+        (
+            "sessions",
+            "model_id",
+            "TEXT NOT NULL DEFAULT 'legacy-default'",
+        ),
+        ("messages", "model", "TEXT"),
     ] {
         let has_column = {
             let mut columns = conn
@@ -225,9 +303,35 @@ fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
 
 #[tauri::command]
 fn set_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    set_settings_inner(&state, settings)
+}
+
+fn set_settings_inner(state: &AppState, settings: Settings) -> Result<(), String> {
+    let settings = settings.normalize();
     api_endpoint(&settings.base_url)?;
-    if settings.api_key.trim().is_empty() || settings.model.trim().is_empty() {
-        return Err("API Key 和模型名称不能为空".into());
+    if settings.models.is_empty() {
+        return Err("至少需要配置一个模型".into());
+    }
+    let mut ids = HashSet::new();
+    for model in &settings.models {
+        api_endpoint(&model.base_url)?;
+        if model.name.trim().is_empty()
+            || model.model.trim().is_empty()
+            || model.api_key.trim().is_empty()
+        {
+            return Err("每个模型都需要填写名称、API 地址、API Key 和模型名".into());
+        }
+        if model.id.is_empty() || !ids.insert(&model.id) {
+            return Err("模型 ID 重复，请重新添加模型".into());
+        }
+    }
+    for session in load_sessions(state)? {
+        if !ids.contains(&session.model_id) {
+            return Err(format!(
+                "「{}」正在使用被删除的模型，请先在会话设置中更换模型",
+                session.title
+            ));
+        }
     }
     save_settings(&state, &settings)?;
     *state.settings.lock().map_err(|e| e.to_string())? = settings;
@@ -245,7 +349,7 @@ fn load_sessions(state: &AppState) -> Result<Vec<ChatSession>, String> {
         let conn = open_database(&path)?;
         let mut stmt = conn
             .prepare(
-                "SELECT id,title,system_prompt,created_at,updated_at,last_message,stream,temperature FROM sessions",
+                "SELECT id,title,system_prompt,created_at,updated_at,last_message,stream,temperature,model_id FROM sessions",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -259,6 +363,7 @@ fn load_sessions(state: &AppState) -> Result<Vec<ChatSession>, String> {
                     last_message: r.get(5)?,
                     stream: r.get(6)?,
                     temperature: r.get(7)?,
+                    model_id: r.get(8)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -298,15 +403,22 @@ fn create_session_inner(
     } else {
         title.trim().to_string()
     };
+    let model_id = state
+        .settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .default_model_id
+        .clone();
     let conn = open_database(&today_path(&state))?;
-    conn.execute("INSERT INTO sessions(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature) VALUES(?1,?2,?3,?4,?4,'',1,0)",
-        params![id, title, system_prompt, timestamp]).map_err(|e| e.to_string())?;
+    conn.execute("INSERT INTO sessions(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature,model_id) VALUES(?1,?2,?3,?4,?4,'',1,0,?5)",
+        params![id, title, system_prompt, timestamp, model_id]).map_err(|e| e.to_string())?;
     Ok(ChatSession {
         id,
         title,
         system_prompt,
         stream: true,
         temperature: Some(0.0),
+        model_id,
         created_at: timestamp.clone(),
         updated_at: timestamp,
         last_message: String::new(),
@@ -317,7 +429,7 @@ fn load_messages(state: &AppState, session_id: &str) -> Result<Vec<ChatMessage>,
     let mut messages = Vec::new();
     for path in db_files(state)? {
         let conn = open_database(&path)?;
-        let mut stmt = conn.prepare("SELECT id,session_id,role,content,images,created_at,reply_to_id FROM messages WHERE session_id=?1 ORDER BY created_at, rowid")
+        let mut stmt = conn.prepare("SELECT id,session_id,role,content,images,created_at,reply_to_id,model FROM messages WHERE session_id=?1 ORDER BY created_at, rowid")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([session_id], |r| {
@@ -330,6 +442,7 @@ fn load_messages(state: &AppState, session_id: &str) -> Result<Vec<ChatMessage>,
                     images: serde_json::from_str(&images_json).unwrap_or_default(),
                     created_at: r.get(5)?,
                     reply_to_id: r.get(6)?,
+                    model: r.get(7)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -377,11 +490,11 @@ fn append_message(
     let image_json = serde_json::to_string(images).map_err(|e| e.to_string())?;
     let conn = open_database(&today_path(state))?;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO sessions(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-      ON CONFLICT(id) DO UPDATE SET title=excluded.title,system_prompt=excluded.system_prompt,updated_at=excluded.updated_at,last_message=excluded.last_message,stream=excluded.stream,temperature=excluded.temperature",
-        params![session.id, session.title, session.system_prompt, session.created_at, timestamp, content, session.stream, session.temperature])
+    tx.execute("INSERT INTO sessions(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature,model_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+      ON CONFLICT(id) DO UPDATE SET title=excluded.title,system_prompt=excluded.system_prompt,updated_at=excluded.updated_at,last_message=excluded.last_message,stream=excluded.stream,temperature=excluded.temperature,model_id=excluded.model_id",
+        params![session.id, session.title, session.system_prompt, session.created_at, timestamp, content, session.stream, session.temperature, session.model_id])
         .map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO messages(id,session_id,role,content,images,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+    tx.execute("INSERT INTO messages(id,session_id,role,content,images,created_at,model) VALUES(?1,?2,?3,?4,?5,?6,NULL)",
         params![id, session.id, role, content, image_json, timestamp]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(ChatMessage {
@@ -392,6 +505,7 @@ fn append_message(
         images: images.to_vec(),
         created_at: timestamp,
         reply_to_id: None,
+        model: None,
     })
 }
 
@@ -434,6 +548,7 @@ fn save_reply(
     user_id: &str,
     old_reply: Option<ChatMessage>,
     content: &str,
+    model: &str,
 ) -> Result<ChatMessage, String> {
     let timestamp = now();
     let history = load_messages(state, &session.id)?;
@@ -476,6 +591,7 @@ fn save_reply(
                 images: Vec::new(),
                 created_at: timestamp.clone(),
                 reply_to_id: Some(user_id.into()),
+                model: Some(model.into()),
             },
             today.clone(),
         )
@@ -495,14 +611,15 @@ fn save_reply(
         "sessions"
     };
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute("INSERT INTO messages(id,session_id,role,content,images,created_at,reply_to_id) VALUES(?1,?2,'assistant',?3,'[]',?4,?5)
-        ON CONFLICT(id) DO UPDATE SET content=excluded.content,images=excluded.images,reply_to_id=excluded.reply_to_id",
-        params![saved.id, session.id, content, saved.created_at, user_id]).map_err(|e| e.to_string())?;
-    tx.execute(&format!("INSERT INTO {sessions_table}(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-        ON CONFLICT(id) DO UPDATE SET title=excluded.title,system_prompt=excluded.system_prompt,updated_at=excluded.updated_at,last_message=excluded.last_message,stream=excluded.stream,temperature=excluded.temperature"),
-        params![session.id, session.title, session.system_prompt, session.created_at, timestamp, preview, session.stream, session.temperature]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO messages(id,session_id,role,content,images,created_at,reply_to_id,model) VALUES(?1,?2,'assistant',?3,'[]',?4,?5,?6)
+        ON CONFLICT(id) DO UPDATE SET content=excluded.content,images=excluded.images,reply_to_id=excluded.reply_to_id,model=excluded.model",
+        params![saved.id, session.id, content, saved.created_at, user_id, model]).map_err(|e| e.to_string())?;
+    tx.execute(&format!("INSERT INTO {sessions_table}(id,title,system_prompt,created_at,updated_at,last_message,stream,temperature,model_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+        ON CONFLICT(id) DO UPDATE SET title=excluded.title,system_prompt=excluded.system_prompt,updated_at=excluded.updated_at,last_message=excluded.last_message,stream=excluded.stream,temperature=excluded.temperature,model_id=excluded.model_id"),
+        params![session.id, session.title, session.system_prompt, session.created_at, timestamp, preview, session.stream, session.temperature, session.model_id]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     saved.reply_to_id = Some(user_id.into());
+    saved.model = Some(model.into());
     Ok(saved)
 }
 
@@ -510,8 +627,8 @@ fn find_session(state: &AppState, session_id: &str) -> Result<Option<ChatSession
     let mut found = None;
     for path in db_files(state)? {
         let conn = open_database(&path)?;
-        let row = conn.query_row("SELECT id,title,system_prompt,created_at,updated_at,last_message,stream,temperature FROM sessions WHERE id=?1", [session_id], |r| Ok(ChatSession {
-            id: r.get(0)?, title: r.get(1)?, system_prompt: r.get(2)?, created_at: r.get(3)?, updated_at: r.get(4)?, last_message: r.get(5)?, stream: r.get(6)?, temperature: r.get(7)?,
+        let row = conn.query_row("SELECT id,title,system_prompt,created_at,updated_at,last_message,stream,temperature,model_id FROM sessions WHERE id=?1", [session_id], |r| Ok(ChatSession {
+            id: r.get(0)?, title: r.get(1)?, system_prompt: r.get(2)?, created_at: r.get(3)?, updated_at: r.get(4)?, last_message: r.get(5)?, stream: r.get(6)?, temperature: r.get(7)?, model_id: r.get(8)?,
         })).optional().map_err(|e| e.to_string())?;
         if let Some(item) = row {
             if found
@@ -547,8 +664,19 @@ fn update_session_inner(
     let options = request_options.unwrap_or(RequestOptions {
         stream: session.stream,
         temperature: session.temperature,
+        model_id: session.model_id.clone(),
     });
     validate_temperature(options.temperature)?;
+    if !state
+        .settings
+        .lock()
+        .map_err(|e| e.to_string())?
+        .models
+        .iter()
+        .any(|model| model.id == options.model_id)
+    {
+        return Err("请选择一个有效的模型".into());
+    }
     let cleaned_title = if title.trim().is_empty() {
         "新对话"
     } else {
@@ -559,8 +687,8 @@ fn update_session_inner(
         let conn = open_database(&path)?;
         let changed = conn
             .execute(
-                "UPDATE sessions SET title=?2,system_prompt=?3,updated_at=?4,stream=?5,temperature=?6 WHERE id=?1",
-                params![session_id, cleaned_title, system_prompt, now(), options.stream, options.temperature],
+                "UPDATE sessions SET title=?2,system_prompt=?3,updated_at=?4,stream=?5,temperature=?6,model_id=?7 WHERE id=?1",
+                params![session_id, cleaned_title, system_prompt, now(), options.stream, options.temperature, options.model_id],
             )
             .map_err(|e| e.to_string())?;
         updated |= changed > 0;
@@ -723,10 +851,11 @@ async fn send_message_with_progress(
     };
     let session = find_session(&state, &session_id)?.ok_or_else(|| "找不到这个会话".to_string())?;
     let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
-    let endpoint = api_endpoint(&settings.base_url)?;
+    let profile = settings.profile(&session.model_id)?;
+    let endpoint = api_endpoint(&profile.base_url)?;
     validate_temperature(session.temperature)?;
-    if settings.api_key.trim().is_empty() {
-        return Err("请先在设置中填写 API Key".into());
+    if profile.api_key.trim().is_empty() {
+        return Err("请先在设置中填写所选模型的 API Key".into());
     }
 
     let (history, old_reply) = if let Some(message_id) = retry_message_id {
@@ -767,14 +896,14 @@ async fn send_message_with_progress(
         .build()
         .map_err(|e| e.to_string())?;
     let mut body =
-        json!({ "model": settings.model, "messages": prompt_messages, "stream": session.stream });
+        json!({ "model": profile.model, "messages": prompt_messages, "stream": session.stream });
     if let Some(temperature) = session.temperature {
         body["temperature"] = json!(temperature);
     }
     let mut response = client
         .post(endpoint)
         .json(&body)
-        .bearer_auth(settings.api_key.trim())
+        .bearer_auth(profile.api_key.trim())
         .send()
         .await
         .map_err(|e| network_error(&e))?;
@@ -838,7 +967,14 @@ async fn send_message_with_progress(
     };
     let latest_session =
         find_session(&state, &session_id)?.ok_or_else(|| "找不到这个会话".to_string())?;
-    save_reply(state, &latest_session, &user_id, old_reply, &reply)
+    save_reply(
+        state,
+        &latest_session,
+        &user_id,
+        old_reply,
+        &reply,
+        &profile.model,
+    )
 }
 
 #[tauri::command]
@@ -931,7 +1067,8 @@ pub fn run() {
             let settings = fs::read(data_dir.join("settings.json"))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .normalize();
             app.manage(AppState {
                 data_dir,
                 settings: Arc::new(Mutex::new(settings)),
@@ -972,6 +1109,213 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_model_settings_migrate_without_losing_connection() {
+        let settings = serde_json::from_value::<Settings>(json!({
+            "baseUrl": "https://old.test/v1", "apiKey": "old-key", "model": "old-model"
+        }))
+        .unwrap()
+        .normalize();
+        assert_eq!(settings.models.len(), 1);
+        assert_eq!(settings.default_model_id, "legacy-default");
+        let profile = settings.profile("legacy-default").unwrap();
+        assert_eq!(profile.base_url, "https://old.test/v1");
+        assert_eq!(profile.api_key, "old-key");
+        assert_eq!(profile.model, "old-model");
+        let restored = serde_json::from_slice::<Settings>(&serde_json::to_vec(&settings).unwrap())
+            .unwrap()
+            .normalize();
+        assert_eq!(restored.models[0].api_key, "old-key");
+    }
+
+    #[test]
+    fn model_choices_persist_across_days_default_changes_and_settings_reload() {
+        let state = test_state();
+        let settings = Settings {
+            models: vec![
+                ModelProfile {
+                    id: "legacy-default".into(),
+                    name: "旧模型".into(),
+                    base_url: "https://a.test/v1".into(),
+                    api_key: "key-a".into(),
+                    model: "model-a".into(),
+                },
+                ModelProfile {
+                    id: "b".into(),
+                    name: "模型 B".into(),
+                    base_url: "https://b.test/v1".into(),
+                    api_key: "key-b".into(),
+                    model: "model-b".into(),
+                },
+            ],
+            ..Settings::default()
+        }
+        .normalize();
+        set_settings_inner(&state, settings.clone()).unwrap();
+        let old = Connection::open(database_path(&state, "2000-01-01")).unwrap();
+        old.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,title TEXT,system_prompt TEXT,created_at TEXT,updated_at TEXT,last_message TEXT);
+            INSERT INTO sessions VALUES('old','旧会话','','2000-01-01','2000-01-01','');").unwrap();
+        drop(old);
+        let first = find_session(&state, "old").unwrap().unwrap();
+        assert_eq!(first.model_id, "legacy-default");
+        let mut changed = settings;
+        changed.default_model_id = "b".into();
+        set_settings_inner(&state, changed.clone()).unwrap();
+        assert_eq!(
+            find_session(&state, "old").unwrap().unwrap().model_id,
+            "legacy-default"
+        );
+        assert_eq!(
+            create_session_inner(&state, "新会话".into(), "".into())
+                .unwrap()
+                .model_id,
+            "b"
+        );
+        append_message(&state, &first, "user", "跨日提问", &[]).unwrap();
+        update_session_inner(
+            &state,
+            "old",
+            "改名",
+            "",
+            Some(RequestOptions {
+                stream: true,
+                temperature: Some(0.0),
+                model_id: "b".into(),
+            }),
+        )
+        .unwrap();
+        update_session_inner(&state, "old", "再次改名", "", None).unwrap();
+        for path in db_files(&state).unwrap() {
+            let conn = open_database(&path).unwrap();
+            let id: String = conn
+                .query_row("SELECT model_id FROM sessions WHERE id='old'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(id, "b");
+        }
+        let mut removed = changed.clone();
+        removed.models.retain(|profile| profile.id != "b");
+        assert!(set_settings_inner(&state, removed)
+            .unwrap_err()
+            .contains("正在使用"));
+        let stored = serde_json::from_slice::<Settings>(
+            &fs::read(state.data_dir.join("settings.json")).unwrap(),
+        )
+        .unwrap()
+        .normalize();
+        assert_eq!(stored.default_model_id, "b");
+        assert_eq!(stored.profile("b").unwrap().api_key, "key-b");
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_sessions_route_to_their_own_models_and_retry_uses_current_choice() {
+        let requests = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let capture = requests.clone();
+        let router = Router::new().route(
+            "/:provider/chat/completions",
+            axum::routing::post(
+                move |AxumPath(provider): AxumPath<String>,
+                      headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<Value>| {
+                    let capture = capture.clone();
+                    async move {
+                        capture.lock().unwrap().push((
+                            provider,
+                            headers["authorization"].to_str().unwrap().to_string(),
+                            body.clone(),
+                        ));
+                        axum::Json(json!({"choices":[{"message":{"content":body["model"]}}]}))
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let state = test_state();
+        let profiles = vec![
+            ModelProfile {
+                id: "a".into(),
+                name: "模型 A".into(),
+                base_url: format!("http://{address}/a"),
+                api_key: "key-a".into(),
+                model: "model-a".into(),
+            },
+            ModelProfile {
+                id: "b".into(),
+                name: "模型 B".into(),
+                base_url: format!("http://{address}/b/chat/completions"),
+                api_key: "key-b".into(),
+                model: "model-b".into(),
+            },
+        ];
+        *state.settings.lock().unwrap() = Settings {
+            models: profiles,
+            default_model_id: "a".into(),
+            ..Settings::default()
+        }
+        .normalize();
+        let a = create_session_inner(&state, "A".into(), "".into()).unwrap();
+        let b = create_session_inner(&state, "B".into(), "".into()).unwrap();
+        update_session_inner(
+            &state,
+            &b.id,
+            "B",
+            "",
+            Some(RequestOptions {
+                stream: false,
+                temperature: None,
+                model_id: "b".into(),
+            }),
+        )
+        .unwrap();
+        let (reply_a, reply_b) = tokio::join!(
+            send_message_inner(&state, a.id.clone(), "问题 A".into(), vec![], None),
+            send_message_inner(&state, b.id.clone(), "问题 B".into(), vec![], None)
+        );
+        let reply_a = reply_a.unwrap();
+        assert_eq!(reply_a.model.as_deref(), Some("model-a"));
+        assert_eq!(reply_b.unwrap().model.as_deref(), Some("model-b"));
+        {
+            let captured = requests.lock().unwrap();
+            assert!(captured.iter().any(|(provider, auth, body)| provider == "a"
+                && auth == "Bearer key-a"
+                && body["model"] == "model-a"));
+            assert!(captured.iter().any(|(provider, auth, body)| provider == "b"
+                && auth == "Bearer key-b"
+                && body["model"] == "model-b"));
+        }
+        update_session_inner(
+            &state,
+            &a.id,
+            "A",
+            "",
+            Some(RequestOptions {
+                stream: true,
+                temperature: Some(0.0),
+                model_id: "b".into(),
+            }),
+        )
+        .unwrap();
+        let retry = send_message_inner(
+            &state,
+            a.id.clone(),
+            "".into(),
+            vec![],
+            Some(reply_a.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.id, reply_a.id);
+        assert_eq!(retry.model.as_deref(), Some("model-b"));
+        assert_eq!(load_messages(&state, &a.id).unwrap().len(), 2);
+        assert_eq!(requests.lock().unwrap().last().unwrap().0, "b");
+        server.abort();
+        fs::remove_dir_all(state.data_dir).unwrap();
+    }
+
+    #[test]
     fn new_sessions_persist_defaults_even_with_old_schema_defaults() {
         let state = test_state();
         let conn = Connection::open(today_path(&state)).unwrap();
@@ -1010,6 +1354,7 @@ mod tests {
             Some(RequestOptions {
                 stream: true,
                 temperature: Some(0.0),
+                model_id: default_model_id(),
             }),
         )
         .unwrap();
@@ -1045,7 +1390,8 @@ mod tests {
                 "",
                 Some(RequestOptions {
                     stream: false,
-                    temperature: Some(temperature)
+                    temperature: Some(temperature),
+                    model_id: default_model_id(),
                 })
             )
             .is_err());
@@ -1118,13 +1464,17 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: "test".into(),
             model: "test".into(),
-        };
+            models: Vec::new(),
+            ..Settings::default()
+        }
+        .normalize();
         let session = ChatSession {
             id: "s".into(),
             title: "流式测试".into(),
             system_prompt: "".into(),
             stream: true,
             temperature: Some(0.7),
+            model_id: default_model_id(),
             created_at: now(),
             updated_at: now(),
             last_message: "".into(),
@@ -1185,6 +1535,7 @@ mod tests {
                     Some(RequestOptions {
                         stream: false,
                         temperature: None,
+                        model_id: default_model_id(),
                     }),
                 )
                 .unwrap();
@@ -1261,6 +1612,7 @@ mod tests {
             system_prompt: "看图回答".into(),
             stream: false,
             temperature: None,
+            model_id: default_model_id(),
             created_at: now(),
             updated_at: now(),
             last_message: String::new(),
@@ -1407,7 +1759,10 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: "test-key".into(),
             model: "test".into(),
-        };
+            models: Vec::new(),
+            ..Settings::default()
+        }
+        .normalize();
         let conn = open_database(&today_path(&state)).unwrap();
         conn.execute(
             "INSERT INTO sessions(id,title,system_prompt,created_at,updated_at,last_message) VALUES('s','重试会话','看图回答',?1,?1,'')",
@@ -1495,7 +1850,10 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: "test".into(),
             model: "vision".into(),
-        };
+            models: Vec::new(),
+            ..Settings::default()
+        }
+        .normalize();
         // Build a pre-0.1.3 daily database without reply_to_id.
         let conn = Connection::open(database_path(&state, "2000-01-01")).unwrap();
         conn.execute_batch("CREATE TABLE sessions(id TEXT PRIMARY KEY,title TEXT,system_prompt TEXT,created_at TEXT,updated_at TEXT,last_message TEXT);

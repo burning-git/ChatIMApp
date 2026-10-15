@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
+import { QRCodeSVG } from "qrcode.react";
 import {
   Activity, ArrowUp, AudioLines, Bookmark, Check, ChevronDown, ChevronRight,
   CircleHelp, Command, Copy, FileText, FolderClock, ImagePlus, Link2, LockKeyhole,
@@ -9,10 +10,10 @@ import {
 import { api, desktop } from "./api";
 import { MAX_IMAGES } from "./image-url";
 import { version as appVersion } from "../package.json";
-import type { ChatMessage, ChatSession, Draft, Settings } from "./types";
+import type { ChatMessage, ChatSession, Draft, ModelProfile, Settings } from "./types";
 
-type Modal = "settings" | "prompt" | "share" | "delete" | "image-url" | null;
-const EMPTY_SETTINGS: Settings = { baseUrl: "", apiKey: "", model: "gpt-4o-mini" };
+type Modal = "settings" | "prompt" | "delete" | "image-url" | null;
+const EMPTY_SETTINGS: Settings = { baseUrl: "", apiKey: "", model: "gpt-4o-mini", defaultModelId: "legacy-default", models: [{ id: "legacy-default", name: "默认模型", baseUrl: "", apiKey: "", model: "gpt-4o-mini" }] };
 const EMPTY_DRAFT: Draft = { text: "", images: [] };
 
 function dateLabel(value: string) {
@@ -57,6 +58,7 @@ function App() {
   const [titleDraft, setTitleDraft] = useState("");
   const [streamDraft, setStreamDraft] = useState(true);
   const [temperatureDraft, setTemperatureDraft] = useState("0");
+  const [modelDraft, setModelDraft] = useState("legacy-default");
   const [imageUrlDraft, setImageUrlDraft] = useState("");
   const [imageUrlError, setImageUrlError] = useState("");
   const [imageImports, setImageImports] = useState<string[]>([]);
@@ -64,8 +66,9 @@ function App() {
   const [promptError, setPromptError] = useState("");
   const [streamingText, setStreamingText] = useState<Record<string, string>>({});
   const [settingsDraft, setSettingsDraft] = useState<Settings>(EMPTY_SETTINGS);
-  const [shareUrl, setShareUrl] = useState("");
-  const [shareCopied, setShareCopied] = useState(false);
+  const [copiedShareUrl, setCopiedShareUrl] = useState("");
+  const [sharePending, setSharePending] = useState<string[]>([]);
+  const sharePendingRef = useRef(new Set<string>());
   const [query, setQuery] = useState("");
   const [isSidebarOpen, setSidebarOpen] = useState(window.innerWidth > 760);
   const [loading, setLoading] = useState(true);
@@ -145,6 +148,11 @@ function App() {
   }, [modal, sessions]);
 
   const current = sessions.find(session => session.id === activeId);
+  const currentModel = settings.models.find(profile => profile.id === current?.modelId);
+  const shareUrl = shareUrls[activeId] || "";
+  useEffect(() => {
+    if (shareUrl) document.getElementById("lan-sharing")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [shareUrl]);
   const currentMessages = messages[activeId] || [];
   const lastMessage = currentMessages[currentMessages.length - 1];
   const canRetry = !busy.includes(activeId);
@@ -222,7 +230,7 @@ function App() {
     const text = draft.text.trim();
     if (!activeId || (!text && !draft.images.length)) return;
     if (imageImportsRef.current.has(activeId)) { setToast("请等图片添加完成再发送"); return; }
-    if (!settings.baseUrl.trim() || !settings.apiKey.trim()) {
+    if (!currentModel?.baseUrl.trim() || !currentModel.apiKey.trim()) {
       setSettingsDraft(settings); setSettingsError("请先配置 API 地址和 Key，输入内容会保留"); setModal("settings"); return;
     }
     if (busyRef.current.has(activeId)) return;
@@ -264,13 +272,14 @@ function App() {
     setPromptDraft(current.systemPrompt);
     setStreamDraft(current.stream);
     setTemperatureDraft(current.temperature === null ? "" : String(current.temperature));
+    setModelDraft(current.modelId);
     setPromptError("");
     setModal("prompt");
   }
 
   async function retry(messageId = lastMessage?.id) {
     if (!messageId || !canRetry || busyRef.current.has(activeId)) return;
-    if (!settings.baseUrl.trim() || !settings.apiKey.trim()) {
+    if (!current?.modelId || !settings.models.some(profile => profile.id === current.modelId && profile.baseUrl.trim() && profile.apiKey.trim())) {
       setSettingsDraft(settings); setSettingsError("请先配置 API 地址和 Key，再重试"); setModal("settings"); return;
     }
     if (busyRef.current.size >= 8) { setToast("最多可同时进行 8 个对话，请等一个回复完成"); return; }
@@ -305,10 +314,11 @@ function App() {
   }
 
   async function copyShareLink() {
+    if (!shareUrl) return;
     try {
       await api.copyText(shareUrl);
-      setShareCopied(true);
-      window.setTimeout(() => setShareCopied(false), 2000);
+      setCopiedShareUrl(shareUrl);
+      window.setTimeout(() => setCopiedShareUrl(value => value === shareUrl ? "" : value), 2000);
     } catch (error) { setToast(error instanceof Error ? error.message : String(error)); }
   }
 
@@ -320,7 +330,7 @@ function App() {
     }
     setPromptError("");
     try {
-      await api.update(current.id, titleDraft.trim() || "新对话", promptDraft, { stream: streamDraft, temperature });
+      await api.update(current.id, titleDraft.trim() || "新对话", promptDraft, { stream: streamDraft, temperature, modelId: modelDraft });
       await refreshSessions();
       setModal(null);
       setToast("会话设置已保存");
@@ -328,15 +338,23 @@ function App() {
   }
 
   async function saveSettings() {
-    if (!settingsDraft.baseUrl.trim()) { setSettingsError("请输入兼容 OpenAI 的 API 地址"); return; }
-    if (!settingsDraft.apiKey.trim()) { setSettingsError("请输入 API Key"); return; }
-    try {
-      const url = new URL(settingsDraft.baseUrl.trim());
-      if (!["http:", "https:"].includes(url.protocol)) throw new Error("URL");
-    } catch { setSettingsError("API 地址必须是有效的 http:// 或 https:// 地址"); return; }
+    if (!settingsDraft.models.length) { setSettingsError("至少保留一个模型"); return; }
+    if (!settingsDraft.models.some(profile => profile.id === settingsDraft.defaultModelId)) { setSettingsError("请选择默认模型"); return; }
+    for (const profile of settingsDraft.models) {
+      if (!profile.name.trim() || !profile.model.trim() || !profile.apiKey.trim()) { setSettingsError("每个模型都需要填写名称、模型名和 API Key"); return; }
+      try {
+        const url = new URL(profile.baseUrl.trim());
+        if (!["http:", "https:"].includes(url.protocol)) throw new Error("URL");
+      } catch { setSettingsError(`「${profile.name || "未命名模型"}」的 API 地址必须是有效的 http:// 或 https:// 地址`); return; }
+    }
+    const modelIds = new Set(settingsDraft.models.map(profile => profile.id));
+    const removedInUse = sessions.find(session => !modelIds.has(session.modelId));
+    if (removedInUse) { setSettingsError(`「${removedInUse.title}」正在使用被删除的模型，请先在会话设置中更换模型`); return; }
     setSettingsError("");
     try {
-      const saved = { ...settingsDraft, baseUrl: settingsDraft.baseUrl.trim().replace(/\/+$/, ""), apiKey: settingsDraft.apiKey.trim(), model: settingsDraft.model.trim() || "gpt-4o-mini" };
+      const models = settingsDraft.models.map(profile => ({ ...profile, name: profile.name.trim(), baseUrl: profile.baseUrl.trim().replace(/\/+$/, ""), apiKey: profile.apiKey.trim(), model: profile.model.trim() }));
+      const selected = models.find(profile => profile.id === settingsDraft.defaultModelId)!;
+      const saved = { ...settingsDraft, models, baseUrl: selected.baseUrl, apiKey: selected.apiKey, model: selected.model };
       await api.saveSettings(saved);
       setSettings(saved);
       setModal(null);
@@ -344,31 +362,66 @@ function App() {
     } catch (error) { setSettingsError(String(error)); }
   }
 
+  function addModel() {
+    const profile: ModelProfile = { id: crypto.randomUUID(), name: `模型 ${settingsDraft.models.length + 1}`, baseUrl: settingsDraft.models[0]?.baseUrl || "", apiKey: settingsDraft.models[0]?.apiKey || "", model: "" };
+    setSettingsDraft(current => ({ ...current, models: [...current.models, profile] }));
+    setSettingsError("");
+  }
+
+  function removeModel(id: string) {
+    const using = sessions.find(session => session.modelId === id);
+    if (using) { setSettingsError(`「${using.title}」正在使用这个模型，请先在会话设置中更换模型`); return; }
+    const models = settingsDraft.models.filter(profile => profile.id !== id);
+    if (!models.length) { setSettingsError("至少保留一个模型"); return; }
+    setSettingsDraft(current => ({ ...current, models, defaultModelId: current.defaultModelId === id ? models[0].id : current.defaultModelId }));
+    setSettingsError("");
+  }
+
+  function updateModel(id: string, patch: Partial<ModelProfile>) {
+    setSettingsDraft(current => ({ ...current, models: current.models.map(profile => profile.id === id ? { ...profile, ...patch } : profile) }));
+  }
+
   async function startShare() {
     if (!current) return;
+    const id = current.id;
+    if (sharePendingRef.current.has(id)) return;
+    if (shareUrls[id]) {
+      document.getElementById("lan-sharing")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      return;
+    }
+    sharePendingRef.current.add(id);
+    setSharePending([...sharePendingRef.current]);
     try {
-      const url = shareUrls[current.id] || await api.share(current.id);
-      setShareUrls(rows => ({ ...rows, [current.id]: url }));
-      setShareUrl(url);
-      setModal("share");
+      const url = await api.share(id);
+      setShareUrls(rows => ({ ...rows, [id]: url }));
     } catch (error) { setToast(String(error)); }
+    finally {
+      sharePendingRef.current.delete(id);
+      setSharePending([...sharePendingRef.current]);
+    }
   }
 
   async function stopShare() {
     if (!current) return;
+    const id = current.id;
+    if (sharePendingRef.current.has(id)) return;
+    sharePendingRef.current.add(id);
+    setSharePending([...sharePendingRef.current]);
     try {
-      await api.unshare(current.id);
-      setShareUrls(rows => { const copy = { ...rows }; delete copy[current.id]; return copy; });
-      setShareUrl("");
-      setModal(null);
+      await api.unshare(id);
+      setShareUrls(rows => { const copy = { ...rows }; delete copy[id]; return copy; });
       setToast("局域网访问已关闭，旧链接已失效");
     } catch (error) { setToast(String(error)); }
+    finally {
+      sharePendingRef.current.delete(id);
+      setSharePending([...sharePendingRef.current]);
+    }
   }
 
   async function deleteCurrent() {
     if (!current) return;
     const id = current.id;
-    if (busyRef.current.has(id) || imageImportsRef.current.has(id)) { setToast("请等这个会话的回复或图片添加完成后再删除"); setModal(null); return; }
+    if (busyRef.current.has(id) || imageImportsRef.current.has(id) || sharePendingRef.current.has(id)) { setToast("请等这个会话的操作完成后再删除"); setModal(null); return; }
     try {
       await api.remove(id);
       const remaining = sessions.filter(session => session.id !== id);
@@ -401,7 +454,7 @@ function App() {
     }
   }
 
-  return <div className={`app-shell ${isSidebarOpen ? "" : "sidebar-hidden"}`}>
+  return <div className={`app-shell ${isSidebarOpen ? "" : "sidebar-hidden"} ${shareUrl ? "sharing-active" : ""}`}>
     {isSidebarOpen && <aside className="sidebar">
       <div className="brand-row">
         <div className="brand-mark"><AudioLines size={19} strokeWidth={2.4} /></div>
@@ -427,7 +480,7 @@ function App() {
       <div className="sidebar-bottom">
         <button className="library-row" onClick={() => document.querySelector(".session-list")?.scrollTo({ top: 0, behavior: "smooth" })}><FolderClock size={16} /><span>历史记录</span><ChevronRight size={15} /></button>
         <div className="account-card">
-          <div className="account-avatar">E</div><div className="account-copy"><strong>本地工作区</strong><small>{settings.model || "尚未配置模型"}</small></div>
+          <div className="account-avatar">E</div><div className="account-copy"><strong>本地工作区</strong><small>{currentModel?.model || "尚未配置模型"}</small></div>
           <button className="icon-button" title="连接设置" onClick={() => { setSettingsDraft(settings); setSettingsError(""); setModal("settings"); }}><Settings2 size={17} /></button>
         </div>
       </div>
@@ -438,10 +491,10 @@ function App() {
         <div className="breadcrumbs">
           {!isSidebarOpen && <button className="icon-button reveal-sidebar" title="展开侧边栏" onClick={() => setSidebarOpen(true)}><PanelLeftClose size={17} /></button>}
           <span className="crumb-muted">工作区</span><ChevronRight size={14} /><span className="crumb-title">{current?.title || "AI 对话"}</span>
-          <span className="connection-dot" title={settings.baseUrl ? "已配置连接" : "尚未配置 API"} />
+          <span className="connection-dot" title={currentModel?.baseUrl ? "已配置连接" : "尚未配置 API"} />
         </div>
         <div className="topbar-actions">
-          <button className="icon-button quick-share" title="局域网只读访问" onClick={startShare}><Link2 size={15} /></button>
+          <button className="icon-button quick-share" title={shareUrl ? "查看局域网二维码" : "开启局域网只读访问"} disabled={sharePending.includes(activeId)} onClick={startShare}><Link2 size={15} /></button>
           <div className={`parallel-indicator ${busy.length ? "working" : ""}`}><Activity size={14} /><span>{busy.length ? `${busy.length} 个对话正在生成` : "最多 8 路并行"}</span></div>
           <span className="topbar-divider" />
           <button className="avatar-button" title="连接设置" onClick={() => { setSettingsDraft(settings); setSettingsError(""); setModal("settings"); }}>E</button>
@@ -479,7 +532,7 @@ function App() {
           <div className="thread-intro"><span className="intro-line" /><span>对话开始于 {new Date(current?.createdAt || Date.now()).toLocaleString("zh-CN", { month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false })}</span><span className="intro-line" /></div>
           {currentMessages.map(message => <article className={`message-row ${message.role}`} key={message.id}>
             <div className={`message-avatar ${message.role}`}>{message.role === "assistant" ? <AudioLines size={15} /> : "E"}</div>
-            <div className="message-body"><div className="message-byline"><strong>{message.role === "assistant" ? "Echo" : "你"}</strong><span>{timeLabel(message.createdAt)}</span>{message.role === "assistant" && <span className="model-tag">{settings.model}</span>}</div>
+            <div className="message-body"><div className="message-byline"><strong>{message.role === "assistant" ? "Echo" : "你"}</strong><span>{timeLabel(message.createdAt)}</span>{message.role === "assistant" && <span className="model-tag">{message.model || "历史回复"}</span>}</div>
               {message.content && <div className="message-content">{message.content}</div>}
               {!!message.images.length && <div className="message-images">{message.images.map((image, imageIndex) => <img key={imageIndex} src={image} referrerPolicy="no-referrer" alt="消息附件" />)}</div>}
               <div className="message-tools message-actions"><button onClick={() => copyMessage(message)} title={message.content ? "复制这条消息的文字" : "这条消息只有图片，没有可复制的文字"} disabled={!message.content}>{copiedMessageId === message.id ? <Check size={13} /> : <Copy size={13} />}{copiedMessageId === message.id ? "已复制" : "复制"}</button><button onClick={() => retry(message.id)} disabled={!canRetry} title="使用原问题和图片重新生成回复；成功后替换该轮回复，保留后续消息"><RotateCw size={13} />{busy.includes(activeId) && retryTargets[activeId] === message.id ? "重试中…" : "重试"}</button></div>
@@ -502,13 +555,14 @@ function App() {
         </div>
         <div className="composer-meta"><span><LockKeyhole size={12} /> 仅你与模型可见</span><span>{imageImports.includes(activeId) ? "正在添加图片…" : "本地图片最大 12 MB · 每条最多 9 张"}</span></div>
       </div>
-      <footer className="statusbar"><span className="status-ready"><i /> 本机私有</span><span>{settings.baseUrl ? `已连接 · ${settings.model}` : "设置 API 地址以开始对话"}</span><button onClick={() => { setSettingsDraft(settings); setSettingsError(""); setModal("settings"); }}>{settings.baseUrl ? "更改连接" : "配置连接"}<ChevronDown size={12} /></button></footer>
+      <footer className="statusbar"><span className="status-ready"><i /> 本机私有</span><span>{currentModel?.baseUrl ? `已连接 · ${currentModel.model}` : "设置 API 地址以开始对话"}</span><button onClick={() => { setSettingsDraft(settings); setSettingsError(""); setModal("settings"); }}>{currentModel?.baseUrl ? "管理模型" : "配置模型"}<ChevronDown size={12} /></button></footer>
     </main>
 
     <aside className="detail-pane">
       <div className="detail-header"><div><span className="detail-eyebrow">当前会话</span><h2>{current?.title || "未命名会话"}</h2></div><button className="icon-button" title="删除会话" onClick={() => setModal("delete")}><Trash2 size={16} /></button></div>
       <div className="detail-rule" />
       <div className="detail-section"><div className="detail-section-title"><span>会话上下文</span><button className="text-action" onClick={openPrompt}><SquarePen size={13} />编辑</button></div>
+        <button className="request-summary" onClick={openPrompt}><span>模型 · {currentModel?.name || "请选择模型"}</span><ChevronRight size={13} /></button>
         <button className="prompt-card" onClick={openPrompt}><span className="prompt-card-icon"><Command size={15} /></span><span><strong>System 提示词</strong><small>{current?.systemPrompt ? `${current.systemPrompt.slice(0, 58)}${current.systemPrompt.length > 58 ? "…" : ""}` : "定义 AI 在这段会话中的行为"}</small></span><ChevronRight size={15} /></button>
         <button className="request-summary" onClick={openPrompt}><span>{current?.stream ? "流式回复" : "完整回复"} · 温度 {current?.temperature ?? "默认"}</span><ChevronRight size={13} /></button>
       </div>
@@ -517,24 +571,42 @@ function App() {
           {busy.length > 0 ? <div className="running-list">{busy.map(id => { const session = sessions.find(item => item.id === id); return <button key={id} onClick={() => selectSession(id)}><span className="live-dot" /><span>{session?.title || "正在对话"}</span><ChevronRight size={13} /></button>; })}</div> : <div className="parallel-idle"><span className="idle-dot" />最多 8 个会话可同时生成</div>}
         </div>
       </div>
-      <div className="detail-section share-section"><div className="detail-section-title"><span>局域网访问</span><span className="read-only-badge"><ShieldCheck size={11} />只读</span></div><div className="share-card"><div className="share-illustration"><span className="share-center"><AudioLines size={15} /></span><span className="share-node node-a" /><span className="share-node node-b" /><span className="share-node node-c" /><span className="share-ring" /></div><strong>在同一网络中查看记录</strong><p>创建临时访问链接。访客只能阅读此会话，不能发送消息或修改内容。</p><button className="share-button" onClick={startShare}><Link2 size={15} />{shareUrls[activeId] ? "管理访问链接" : "创建访问链接"}</button><small className="share-footnote">链接在应用运行时有效，可随时关闭</small></div></div>
+      <div className="detail-section share-section" id="lan-sharing"><div className="detail-section-title"><span>局域网访问</span><span className="read-only-badge"><ShieldCheck size={11} />只读</span></div><div className="share-card">
+        {shareUrl ? <>
+          <div className="share-qr"><QRCodeSVG value={shareUrl} size={192} level="M" marginSize={4} bgColor="#ffffff" fgColor="#111111" role="img" aria-label="当前会话的局域网访问二维码" title="扫码查看当前会话" /></div>
+          <strong>扫码查看会话</strong><p>其他设备连接同一网络后，使用相机或扫码工具打开，只读查看当前会话。</p>
+          <div className="share-address">{shareUrl}</div>
+          <button className="share-button" onClick={copyShareLink}>{copiedShareUrl === shareUrl ? <Check size={14} /> : <Copy size={14} />}{copiedShareUrl === shareUrl ? "已复制链接" : "复制访问链接"}</button>
+          <button className="share-stop-button" disabled={sharePending.includes(activeId)} onClick={stopShare}>{sharePending.includes(activeId) ? "正在关闭…" : "关闭访问"}</button>
+          <small className="share-footnote">应用需保持运行；关闭访问后二维码和链接立即失效</small>
+        </> : <>
+          <div className="share-illustration"><span className="share-center"><AudioLines size={15} /></span><span className="share-node node-a" /><span className="share-node node-b" /><span className="share-node node-c" /><span className="share-ring" /></div><strong>在同一网络中查看记录</strong><p>开启后显示访问二维码。访客只能阅读此会话，不能发送消息或修改内容。</p><button className="share-button" disabled={sharePending.includes(activeId)} onClick={startShare}><Link2 size={15} />{sharePending.includes(activeId) ? "正在开启…" : "开启局域网访问"}</button><small className="share-footnote">二维码和链接在应用运行时有效</small>
+        </>}
+      </div></div>
       <div className="detail-spacer" />
       <div className="security-note"><ShieldCheck size={15} /><span><strong>你的数据，留在你的设备</strong><small>对话按天保存在本地数据库中</small></span></div>
     </aside>
 
     {modal && <div className="modal-scrim" onMouseDown={event => { if (event.target === event.currentTarget) setModal(null); }}>
-      {modal === "settings" && <section className="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-top"><span className="dialog-icon teal"><Settings2 size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="settings-title">连接设置</h2><p>使用任何兼容 OpenAI Chat Completions 的服务。</p></div>
-        <label className="field-label">API 地址<span>API Base URL</span><input autoFocus value={settingsDraft.baseUrl} onChange={event => setSettingsDraft(row => ({ ...row, baseUrl: event.target.value }))} placeholder="https://api.openai.com/v1" /></label>
-        <label className="field-label">API Key<span>保存在此设备</span><input type="password" autoComplete="new-password" value={settingsDraft.apiKey} onChange={event => setSettingsDraft(row => ({ ...row, apiKey: event.target.value }))} placeholder="sk-…" /></label>
-        <label className="field-label">模型名称<span>Model</span><input value={settingsDraft.model} onChange={event => setSettingsDraft(row => ({ ...row, model: event.target.value }))} placeholder="gpt-4o-mini" /></label>
+      {modal === "settings" && <section className="dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="dialog-top"><span className="dialog-icon teal"><Settings2 size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="settings-title">模型管理</h2><p>添加 OpenAI 兼容服务；新会话默认使用所选模型。</p></div>
+        <label className="field-label default-model-field">默认模型<select value={settingsDraft.defaultModelId} onChange={event => setSettingsDraft(row => ({ ...row, defaultModelId: event.target.value }))}>{settingsDraft.models.map(profile => <option key={profile.id} value={profile.id}>{profile.name || profile.model || "未命名模型"}</option>)}</select></label>
+        <div className="model-profile-list">{settingsDraft.models.map((profile, index) => <section className="model-profile" key={profile.id}>
+          <div className="model-profile-heading"><strong>{profile.name || `模型 ${index + 1}`}</strong>{settingsDraft.defaultModelId === profile.id && <span>默认</span>}<button type="button" className="icon-button" title="删除模型" disabled={settingsDraft.models.length === 1 || sessions.some(session => session.modelId === profile.id)} onClick={() => removeModel(profile.id)}><X size={15} /></button></div>
+          <label className="field-label">显示名称<input autoFocus={index === 0} value={profile.name} onChange={event => updateModel(profile.id, { name: event.target.value })} placeholder="例如：OpenAI 主力" /></label>
+          <label className="field-label">API 地址<span>API Base URL</span><input value={profile.baseUrl} onChange={event => updateModel(profile.id, { baseUrl: event.target.value })} placeholder="https://api.openai.com/v1" /></label>
+          <label className="field-label">API Key<span>仅保存在此设备</span><input type="password" autoComplete="new-password" value={profile.apiKey} onChange={event => updateModel(profile.id, { apiKey: event.target.value })} placeholder="sk-…" /></label>
+          <label className="field-label">模型名称<span>Model</span><input value={profile.model} onChange={event => updateModel(profile.id, { model: event.target.value })} placeholder="gpt-4o-mini" /></label>
+        </section>)}</div>
+        <button className="add-model-button" onClick={addModel}><Plus size={15} />添加模型</button>
         {settingsError && <div className="field-error">{settingsError}</div>}
-        <div className="settings-callout"><LockKeyhole size={15} /><span>Key 存储在本机应用数据目录，仅用于向此地址发送请求。</span></div>
-        <div className="dialog-actions"><span className="app-version">回声 Echo · {appVersion}</span><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-primary" onClick={saveSettings}>保存连接</button></div>
+        <div className="settings-callout"><LockKeyhole size={15} /><span>模型连接信息和 Key 保存在本机，只用于向对应服务发送请求。</span></div>
+        <div className="dialog-actions"><span className="app-version">回声 Echo · {appVersion}</span><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-primary" onClick={saveSettings}>保存模型</button></div>
       </section>}
       {modal === "prompt" && <section className="dialog prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-title">
         <div className="dialog-top"><span className="dialog-icon violet"><Command size={17} /></span><button className="icon-button" title="关闭会话设置" onClick={() => setModal(null)}><X size={18} /></button></div>
         <div className="dialog-heading"><h2 id="prompt-title">会话设置</h2><p>为这段对话设置名称、专属指令和回复方式。</p></div>
         <label className="field-label">会话名称<input autoFocus value={titleDraft} onChange={event => setTitleDraft(event.target.value)} placeholder="例如：产品调研" /></label>
+        <label className="field-label">使用模型<select value={modelDraft} onChange={event => setModelDraft(event.target.value)}>{settings.models.map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.model}</option>)}</select></label>
         <label className="field-label">System 提示词<span>{promptDraft.length} 字符</span><textarea className="prompt-textarea" value={promptDraft} onChange={event => setPromptDraft(event.target.value)} placeholder="例如：你是一位严谨的产品研究员。回答时先总结结论，再列出证据。" /></label>
         <label className="stream-option"><span><strong>流式请求</strong><small>开启后，回复会逐步显示</small></span><input type="checkbox" role="switch" checked={streamDraft} onChange={event => setStreamDraft(event.target.checked)} /></label>
         <label className="field-label">温度（Temperature）<input type="number" min="0" max="2" step="any" value={temperatureDraft} onChange={event => setTemperatureDraft(event.target.value)} placeholder="留空使用模型默认值" /><small className="field-help">范围 0–2，越低越稳定，越高越多样。留空不传此参数。</small></label>
@@ -550,7 +622,6 @@ function App() {
         {imageUrlError && <div className="field-error" role="alert">{imageUrlError}</div>}
         <div className="dialog-actions"><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-primary" disabled={!imageUrlDraft.trim() || imageImports.includes(activeId)} onClick={addImageUrl}>{imageImports.includes(activeId) ? "正在添加…" : "添加图片"}</button></div>
       </section>}
-      {modal === "share" && <section className="dialog share-dialog" role="dialog" aria-modal="true" aria-labelledby="share-title"><div className="dialog-top"><span className="dialog-icon mint"><ShieldCheck size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="share-title">只读链接已创建</h2><p>同一 Wi-Fi 下的设备可以通过此链接查看会话记录。</p></div><div className="share-url-box"><Link2 size={15} /><span>{shareUrl}</span><button title="复制链接" onClick={copyShareLink}>{shareCopied ? <Check size={15} /> : <Copy size={15} />}</button></div><div className="share-warning"><LockKeyhole size={14} /><span>链接包含访问凭证。仅分享给你信任的人，关闭后该链接立即失效。</span></div><div className="dialog-actions split-actions"><button className="button-danger-quiet" onClick={stopShare}>关闭访问</button><button className="button-primary" onClick={() => setModal(null)}>{shareCopied ? "已复制" : "完成"}</button></div></section>}
       {modal === "delete" && <section className="dialog delete-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-title"><div className="dialog-top"><span className="dialog-icon rose"><Trash2 size={17} /></span><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div><div className="dialog-heading"><h2 id="delete-title">删除这个会话？</h2><p>“{current?.title}”及其消息、图片数据和草稿会从本机移除。此操作无法撤销。</p></div><div className="delete-summary"><MessageSquarePlus size={16} /><span>{currentMessages.length} 条消息</span><span className="summary-divider" /><span>本地记录</span></div><div className="dialog-actions"><button className="button-quiet" onClick={() => setModal(null)}>取消</button><button className="button-danger" onClick={deleteCurrent}>删除会话</button></div></section>}
     </div>}
     {toast && <div className="toast"><span className="toast-mark"><Check size={13} /></span>{toast}</div>}

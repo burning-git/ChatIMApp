@@ -2,6 +2,16 @@ export interface Settings {
   baseUrl: string;
   apiKey: string;
   model: string;
+  models: ModelProfile[];
+  defaultModelId: string;
+}
+
+export interface ModelProfile {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
 }
 
 export interface ChatSession {
@@ -10,6 +20,7 @@ export interface ChatSession {
   systemPrompt: string;
   stream: boolean;
   temperature: number | null;
+  modelId: string;
   createdAt: string;
   updatedAt: string;
   lastMessage: string;
@@ -23,6 +34,7 @@ export interface ChatMessage {
   images: string[];
   createdAt: string;
   replyToId?: string;
+  model?: string;
 }
 
 export interface Draft {

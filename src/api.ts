@@ -1,8 +1,8 @@
-import type { ChatMessage, ChatSession, Settings } from "./types";
+import type { ChatMessage, ChatSession, ModelProfile, Settings } from "./types";
 import { readChatStream } from "./chat-stream";
 import { validateImages, validateImageUrl } from "./image-url";
 
-type RequestOptions = Pick<ChatSession, "stream" | "temperature">;
+type RequestOptions = Pick<ChatSession, "stream" | "temperature" | "modelId">;
 
 type TauriGlobal = {
   core?: { invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T>; Channel?: new () => { onmessage: (delta: string) => void } };
@@ -13,7 +13,11 @@ const tauri = (window as Window & { __TAURI__?: TauriGlobal }).__TAURI__;
 const tauriInternals = (window as Window & { __TAURI_INTERNALS__?: { invoke: <T>(command: string, args?: Record<string, unknown>) => Promise<T> } }).__TAURI_INTERNALS__;
 const invoke = <T>(command: string, args?: Record<string, unknown>) => tauri?.core?.invoke<T>(command, args) || tauri?.invoke?.<T>(command, args) || tauriInternals?.invoke<T>(command, args) || Promise.reject(new Error("桌面桥接未就绪"));
 export const desktop = Boolean(tauri?.core?.invoke || tauri?.invoke || tauriInternals?.invoke);
-const DEFAULT_SETTINGS: Settings = { baseUrl: "", apiKey: "", model: "gpt-4o-mini" };
+const LEGACY_MODEL_ID = "legacy-default";
+const DEFAULT_SETTINGS: Settings = {
+  baseUrl: "", apiKey: "", model: "gpt-4o-mini", defaultModelId: LEGACY_MODEL_ID,
+  models: [{ id: LEGACY_MODEL_ID, name: "默认模型", baseUrl: "", apiKey: "", model: "gpt-4o-mini" }],
+};
 const prefix = "echo-day-";
 const pending = new Set<string>();
 
@@ -21,6 +25,21 @@ function validateTemperature(value: number | null) {
   if (value !== null && (!Number.isFinite(value) || value < 0 || value > 2)) {
     throw new Error("温度必须在 0 到 2 之间，或留空使用模型默认值");
   }
+}
+
+function normalizeSettings(value: Partial<Settings> & { models?: ModelProfile[] }): Settings {
+  const legacyId = LEGACY_MODEL_ID;
+  const models = value.models?.length ? value.models : [{
+    id: legacyId, name: "默认模型", baseUrl: value.baseUrl || "", apiKey: value.apiKey || "", model: value.model || "gpt-4o-mini",
+  }];
+  const selected = models.find(profile => profile.id === value.defaultModelId) || models[0];
+  return { baseUrl: selected.baseUrl, apiKey: selected.apiKey, model: selected.model, models, defaultModelId: selected.id };
+}
+
+function selectedProfile(settings: Settings, modelId: string): ModelProfile {
+  const profile = settings.models.find(item => item.id === modelId);
+  if (!profile) throw new Error("这个会话使用的模型已不存在，请在会话设置中重新选择");
+  return profile;
 }
 
 async function invokeMessage(command: string, args: Record<string, unknown>, onChunk?: (delta: string) => void) {
@@ -54,8 +73,8 @@ function writeSession(session: ChatSession) {
   localStorage.setItem(prefix + today(), JSON.stringify(day));
 }
 
-function append(session: ChatSession, role: ChatMessage["role"], content: string, images: string[], replyToId?: string): ChatMessage {
-  const message: ChatMessage = { id: crypto.randomUUID(), sessionId: session.id, role, content, images, createdAt: new Date().toISOString(), ...(replyToId ? { replyToId } : {}) };
+function append(session: ChatSession, role: ChatMessage["role"], content: string, images: string[], replyToId?: string, model?: string): ChatMessage {
+  const message: ChatMessage = { id: crypto.randomUUID(), sessionId: session.id, role, content, images, createdAt: new Date().toISOString(), ...(replyToId ? { replyToId } : {}), ...(model ? { model } : {}) };
   const day = readDay();
   day.messages.push(message);
   day.sessions = day.sessions.filter(item => item.id !== session.id);
@@ -84,16 +103,16 @@ function retryContext(history: ChatMessage[], messageId: string) {
   return { user, oldReply, history: history.slice(0, userIndex + 1) };
 }
 
-async function saveReply(session: ChatSession, userId: string, oldReply: ChatMessage | undefined, content: string): Promise<ChatMessage> {
+async function saveReply(session: ChatSession, userId: string, oldReply: ChatMessage | undefined, content: string, model: string): Promise<ChatMessage> {
   let saved: ChatMessage;
   if (oldReply) {
     const day = allDays().find(day => day.messages.some(message => message.id === oldReply.id && message.sessionId === session.id));
     if (!day) throw new Error("原回复不存在，请刷新会话后重试");
-    saved = { ...oldReply, content, images: [], replyToId: userId };
+    saved = { ...oldReply, content, images: [], replyToId: userId, model };
     day.messages = day.messages.map(message => message.id === oldReply.id ? saved : message);
     localStorage.setItem(day.key, JSON.stringify({ sessions: day.sessions, messages: day.messages }));
   } else {
-    saved = append(session, "assistant", content, [], userId);
+    saved = append(session, "assistant", content, [], userId, model);
   }
   const history = await api.messages(session.id);
   writeSession({ ...session, updatedAt: new Date().toISOString(), lastMessage: history[history.length - 1]?.content || "" });
@@ -110,28 +129,42 @@ export const api = {
     await navigator.clipboard.writeText(text);
   },
   async settings(): Promise<Settings> {
-    if (desktop) return invoke<Settings>("get_settings");
+    if (desktop) return normalizeSettings(await invoke<Settings>("get_settings"));
     const value = localStorage.getItem("echo-settings");
-    return value ? JSON.parse(value) : DEFAULT_SETTINGS;
+    return value ? normalizeSettings(JSON.parse(value)) : DEFAULT_SETTINGS;
   },
   async saveSettings(settings: Settings): Promise<void> {
-    if (desktop) return invoke<void>("set_settings", { settings });
-    localStorage.setItem("echo-settings", JSON.stringify(settings));
+    const normalized = normalizeSettings(settings);
+    if (desktop) return invoke<void>("set_settings", { settings: normalized });
+    const sessions = await api.sessions();
+    const ids = new Set(normalized.models.map(profile => profile.id));
+    if (ids.size !== normalized.models.length || normalized.models.some(profile => !profile.id)) throw new Error("模型 ID 重复或无效，请重新添加模型");
+    const inUse = sessions.find(session => !ids.has(session.modelId));
+    if (inUse) throw new Error(`「${inUse.title}」正在使用被删除的模型，请先在会话设置中更换模型`);
+    localStorage.setItem("echo-settings", JSON.stringify(normalized));
   },
   async sessions(): Promise<ChatSession[]> {
     if (desktop) return invoke<ChatSession[]>("list_sessions");
     const map = new Map<string, ChatSession>();
-    allDays().flatMap(day => day.sessions).forEach(saved => {
-      const session = { ...saved, stream: saved.stream ?? true, temperature: saved.temperature === undefined ? 0 : saved.temperature };
-      const old = map.get(session.id);
-      if (!old || session.updatedAt >= old.updatedAt) map.set(session.id, session);
+    const prefs = await api.settings();
+    allDays().forEach(day => {
+      let migrated = false;
+      day.sessions = day.sessions.map(saved => {
+        if (!saved.modelId) { saved = { ...saved, modelId: prefs.defaultModelId }; migrated = true; }
+        const session = { ...saved, stream: saved.stream ?? true, temperature: saved.temperature === undefined ? 0 : saved.temperature };
+        const old = map.get(session.id);
+        if (!old || session.updatedAt >= old.updatedAt) map.set(session.id, session);
+        return saved;
+      });
+      if (migrated) localStorage.setItem(day.key, JSON.stringify({ sessions: day.sessions, messages: day.messages }));
     });
     return [...map.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   },
   async create(title = "新对话", systemPrompt = ""): Promise<ChatSession> {
     if (desktop) return invoke<ChatSession>("create_session", { title, systemPrompt });
     const time = new Date().toISOString();
-    const session: ChatSession = { id: crypto.randomUUID(), title, systemPrompt, stream: true, temperature: 0, createdAt: time, updatedAt: time, lastMessage: "" };
+    const prefs = await api.settings();
+    const session: ChatSession = { id: crypto.randomUUID(), title, systemPrompt, stream: true, temperature: 0, modelId: prefs.defaultModelId, createdAt: time, updatedAt: time, lastMessage: "" };
     writeSession(session);
     return session;
   },
@@ -140,7 +173,8 @@ export const api = {
     if (desktop) return invoke<void>("update_session", { sessionId, title, systemPrompt, requestOptions: requestOptions || null });
     const session = (await api.sessions()).find(item => item.id === sessionId);
     if (!session) throw new Error("找不到这个会话");
-    writeSession({ ...session, ...requestOptions, title, systemPrompt, updatedAt: new Date().toISOString() });
+    if (requestOptions?.modelId) selectedProfile(await api.settings(), requestOptions.modelId);
+    writeSession({ ...session, ...requestOptions, modelId: requestOptions?.modelId || session.modelId, title, systemPrompt, updatedAt: new Date().toISOString() });
   },
   async remove(sessionId: string): Promise<void> {
     if (desktop) {
@@ -172,9 +206,10 @@ export const api = {
     pending.add(sessionId);
     try {
       const settings = await api.settings();
-      if (!settings.baseUrl || !settings.apiKey) throw new Error("请先在设置中填写 API 地址和 API Key");
       const session = (await api.sessions()).find(item => item.id === sessionId);
       if (!session) throw new Error("找不到这个会话");
+      const profile = selectedProfile(settings, session.modelId);
+      if (!profile.baseUrl || !profile.apiKey) throw new Error("请先在设置中填写所选模型的 API 地址和 API Key");
       validateTemperature(session.temperature);
       let oldReply: ChatMessage | undefined;
       let history: ChatMessage[];
@@ -192,10 +227,10 @@ export const api = {
         role: message.role,
         content: message.images.length ? [{ type: "text", text: message.content }, ...message.images.map(url => ({ type: "image_url", image_url: { url } }))] : message.content,
       }));
-      const base = settings.baseUrl.trim().replace(/\/$/, "");
+      const base = profile.baseUrl.trim().replace(/\/$/, "");
       const endpoint = base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-      const request = { model: settings.model, messages, stream: session.stream, ...(session.temperature !== null ? { temperature: session.temperature } : {}) };
-      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.apiKey}`, Accept: session.stream ? "text/event-stream" : "application/json" }, body: JSON.stringify(request), signal: AbortSignal.timeout(180000) });
+      const request = { model: profile.model, messages, stream: session.stream, ...(session.temperature !== null ? { temperature: session.temperature } : {}) };
+      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${profile.apiKey}`, Accept: session.stream ? "text/event-stream" : "application/json" }, body: JSON.stringify(request), signal: AbortSignal.timeout(180000) });
       const isJson = response.headers?.get("content-type")?.toLowerCase().includes("application/json");
       let reply: string;
       if (response.ok && session.stream && !isJson) {
@@ -209,7 +244,7 @@ export const api = {
       if (!reply) throw new Error("服务响应中没有找到回复内容");
       const latest = (await api.sessions()).find(item => item.id === sessionId);
       if (!latest) throw new Error("找不到这个会话");
-      return await saveReply(latest, userId, oldReply, reply);
+      return await saveReply(latest, userId, oldReply, reply, profile.model);
     } finally {
       pending.delete(sessionId);
     }

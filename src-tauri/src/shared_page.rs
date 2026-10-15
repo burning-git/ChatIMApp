@@ -45,6 +45,7 @@ mod tests {
             system_prompt: "private".into(),
             stream: true,
             temperature: Some(0.0),
+            model_id: super::super::default_model_id(),
             created_at: "now".into(),
             updated_at: "now".into(),
             last_message: "".into(),
@@ -58,6 +59,7 @@ mod tests {
             images: vec![],
             created_at: "now".into(),
             reply_to_id: None,
+            model: None,
         };
         let mut image_only = message.clone();
         image_only.content.clear();

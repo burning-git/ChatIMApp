@@ -19,6 +19,67 @@ Object.defineProperties(localStorage, {
 const { api } = await import(moduleUrl);
 const reset = () => Object.keys(localStorage).forEach(key => delete localStorage[key]);
 
+test("旧单模型配置与历史会话自动迁移，修改默认模型只影响新会话", async () => {
+  reset();
+  const legacy = { baseUrl: "https://old.test/v1", apiKey: "old-key", model: "old-model" };
+  localStorage.setItem("echo-settings", JSON.stringify(legacy));
+  localStorage.setItem("echo-day-2000-01-01", JSON.stringify({ sessions: [{ id: "old", title: "旧会话", systemPrompt: "", createdAt: "2000-01-01", updatedAt: "2000-01-01", lastMessage: "" }], messages: [] }));
+  const prefs = await api.settings();
+  assert.deepEqual(prefs.models[0], { ...legacy, id: "legacy-default", name: "默认模型" });
+  const migrated = (await api.sessions())[0];
+  assert.equal(migrated.modelId, prefs.defaultModelId);
+  const second = { id: "other", name: "其他模型", baseUrl: "https://other.test/v1", apiKey: "other-key", model: "other-model" };
+  await api.saveSettings({ ...prefs, models: [...prefs.models, second], defaultModelId: second.id });
+  assert.equal((await api.sessions())[0].modelId, "legacy-default");
+  assert.equal((await api.create()).modelId, second.id);
+  await assert.rejects(api.saveSettings({ ...prefs, models: [second], defaultModelId: second.id }), /正在使用/);
+  await assert.rejects(api.update("old", "旧会话", "", { stream: true, temperature: 0, modelId: "missing" }), /模型/);
+});
+
+test("多个会话并发分别使用模型的地址与 Key，历史重试按当前所选模型替换", async () => {
+  reset();
+  const models = [
+    { id: "a", name: "模型 A", baseUrl: "https://a.test/v1", apiKey: "key-a", model: "model-a" },
+    { id: "b", name: "模型 B", baseUrl: "https://b.test/v1/chat/completions", apiKey: "key-b", model: "model-b" },
+  ];
+  await api.saveSettings({ models, defaultModelId: "a" });
+  const a = await api.create("会话 A");
+  const b = await api.create("会话 B");
+  await api.update(b.id, b.title, "指令 B", { stream: false, temperature: null, modelId: "b" });
+  await api.update(b.id, "改名 B", "指令 B");
+  const requests = [];
+  const finish = [];
+  globalThis.fetch = (url, options) => new Promise(resolve => {
+    const body = JSON.parse(options.body);
+    requests.push({ url, body, authorization: options.headers.Authorization });
+    finish.push(() => resolve(new Response(JSON.stringify({ choices: [{ message: { content: body.model } }] }), { headers: { "content-type": "application/json" } })));
+  });
+  const sending = [api.send(a.id, "提问 A", []), api.send(b.id, "提问 B", [])];
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].url, "https://a.test/v1/chat/completions");
+  assert.equal(requests[0].authorization, "Bearer key-a");
+  assert.equal(requests[0].body.model, "model-a");
+  assert.equal(requests[1].url, "https://b.test/v1/chat/completions");
+  assert.equal(requests[1].authorization, "Bearer key-b");
+  assert.equal(requests[1].body.model, "model-b");
+  await api.update(a.id, a.title, "", { stream: true, temperature: 0, modelId: "b" });
+  finish.forEach(resolve => resolve());
+  const [replyA, replyB] = await Promise.all(sending);
+  assert.equal(replyA.model, "model-a");
+  assert.equal(replyB.model, "model-b");
+  assert.equal((await api.sessions()).find(row => row.id === a.id).modelId, "b");
+  const retrying = api.retry(a.id, replyA.id);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests[2].body.model, "model-b");
+  assert.equal(requests[2].authorization, "Bearer key-b");
+  finish[2]();
+  const updated = await retrying;
+  assert.equal(updated.id, replyA.id);
+  assert.equal(updated.model, "model-b");
+  assert.equal((await api.messages(a.id)).length, 2);
+});
+
 test("OpenAI 请求携带独立 system 提示词和 Base64 图片，回复持久化", async () => {
   reset();
   await api.saveSettings({ baseUrl: "https://example.test/v1/", apiKey: "test-key", model: "test-vision" });
@@ -400,6 +461,7 @@ test("删除会话清理跨日图片及链接记录，保留其他会话与设�
   const kept = await api.create("保留会话");
   const settings = { baseUrl: "https://example.test/v1", apiKey: "test-key", model: "test" };
   await api.saveSettings(settings);
+  const savedSettings = await api.settings();
   const local = "data:image/png;base64,ZGVsZXRlLWltYWdl";
   const link = "https://example.test/delete-this.png";
   const currentKey = Object.keys(localStorage).find(key => key.startsWith("echo-day-"));
@@ -411,7 +473,7 @@ test("删除会话清理跨日图片及链接记录，保留其他会话与设�
   assert.equal(localStorage.getItem("echo-day-2000-01-01"), null);
   assert.deepEqual((await api.sessions()).map(session => session.id), [kept.id]);
   assert.deepEqual(await api.messages(gone.id), []);
-  assert.deepEqual(await api.settings(), settings);
+  assert.deepEqual(await api.settings(), savedSettings);
   for (const key of Object.keys(localStorage)) {
     assert.ok(!localStorage[key].includes(local));
     assert.ok(!localStorage[key].includes(link));
